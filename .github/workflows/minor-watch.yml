@@ -1,0 +1,38 @@
+name: minor-watch
+
+# Daily check for new PostgreSQL minor releases (see .github/scripts/minor_watch.sh).
+# Opens "Merge PostgreSQL <major>.<n>" (label security) for each major in 14-17
+# that is not listed in FROZEN and whose REL_<major>_STABLE_cheladb is behind
+# the newest REL_<major>_<n> tag on postgres/postgres. Scheduled workflows run
+# from the default branch only (REL_17_STABLE_cheladb).
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: minor-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            FROZEN
+            .github/scripts
+
+      - name: Open issues for missing minors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: .github/scripts/minor_watch.sh
