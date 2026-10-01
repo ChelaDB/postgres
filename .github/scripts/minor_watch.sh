@@ -55,7 +55,7 @@ ensure_label() {
 }
 
 main() {
-    local existing major have n newest missing list title body
+    local existing major have n tags newest missing list title body
     existing="$(gh issue list -R "$repo" --state all --limit 1000 --json title --jq '.[].title')"
     local label_ready=0
 
@@ -65,10 +65,15 @@ main() {
             continue
         fi
         have="$(fork_minor "$major")" || exit 1
+        tags="$(upstream_minors "$major")" || exit 1
+        [[ -n "$tags" ]] || {
+            echo "no REL_${major}_<n> tags found on ${upstream}" >&2
+            exit 1
+        }
         missing=()
         while read -r n; do
             if ((n > have)); then missing+=("$n"); fi
-        done < <(upstream_minors "$major")
+        done <<<"$tags"
         if ((${#missing[@]} == 0)); then
             echo "$major: ${major}.${have} is current"
             continue

@@ -19,6 +19,7 @@ cat >"$tmp/bin/gh" <<'STUB'
 args="$*"
 if [[ "$1" == "api" ]]; then
     if [[ "$args" =~ matching-refs/tags/REL_([0-9]+)_ ]]; then
+        [[ -e "$FIX/tags_fail" ]] && exit 1
         cat "$FIX/tags_${BASH_REMATCH[1]}"
     elif [[ "$args" =~ contents/configure.ac\?ref=REL_([0-9]+)_STABLE_cheladb ]]; then
         cat "$FIX/ac_${BASH_REMATCH[1]}"
@@ -147,6 +148,22 @@ DRY_RUN=1 run
 ok_if "DRY_RUN: no writes" test ! -s "$FIX/writes"
 ok_if "DRY_RUN: prints the title" grep -q 'Merge PostgreSQL 17.11' "$tmp/out"
 ok_if "DRY_RUN: prints the minors" grep -q '17.6, 17.7, 17.8, 17.9, 17.10, 17.11' "$tmp/out"
+
+# 8. A failing or empty tag listing is an error, not "current".
+setup
+touch "$FIX/tags_fail"
+PATH="$tmp/bin:$PATH" FROZEN_FILE="$tmp/FROZEN" "$script" >"$tmp/out" 2>"$tmp/err"
+rc=$?
+ok_if "failing tag listing: exits non-zero" test "$rc" -ne 0
+ok_if "failing tag listing: no writes" test ! -s "$FIX/writes"
+ok_if "failing tag listing: never says current" bash -c "! grep -q current \"\$1\"" _ "$tmp/out"
+
+setup
+: >"$FIX/tags_17"
+PATH="$tmp/bin:$PATH" FROZEN_FILE="$tmp/FROZEN" "$script" >"$tmp/out" 2>"$tmp/err"
+rc=$?
+ok_if "empty tag listing: exits non-zero" test "$rc" -ne 0
+ok_if "empty tag listing: no writes" test ! -s "$FIX/writes"
 
 if ((failures > 0)); then
     echo "$failures failure(s)"
