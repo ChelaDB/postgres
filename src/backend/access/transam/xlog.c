@@ -9229,10 +9229,7 @@ void
 XLogShutdownWalRcv(void)
 {
 	ShutdownWalRcv();
-
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = false;
-	LWLockRelease(ControlFileLock);
+	ResetInstallXLogFileSegmentActive();
 }
 
 /* Enable WAL file recycling and preallocation. */
@@ -9241,6 +9238,15 @@ SetInstallXLogFileSegmentActive(void)
 {
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	XLogCtl->InstallXLogFileSegmentActive = true;
+	LWLockRelease(ControlFileLock);
+}
+
+/* Disable WAL file recycling and preallocation. */
+void
+ResetInstallXLogFileSegmentActive(void)
+{
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	XLogCtl->InstallXLogFileSegmentActive = false;
 	LWLockRelease(ControlFileLock);
 }
 
