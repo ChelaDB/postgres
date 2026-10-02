@@ -1338,6 +1338,16 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 								   ccname,
 								   RelationGetRelationName(relation))));
 
+			/*
+			 * Copying a CHECK constraint adds new references.  Since the
+			 * constraint arrives pre-cooked, it bypasses the checks in
+			 * AddRelationNewConstraints(), so we must check for USAGE on
+			 * types here.
+			 */
+			CheckUsageOnTypesInSingleRelExpr(stringToNode(ccbin),
+											 RelationGetRelid(relation),
+											 GetUserId());
+
 			n = makeNode(Constraint);
 			n->contype = CONSTR_CHECK;
 			n->conname = pstrdup(ccname);
@@ -1897,7 +1907,10 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
  * extended statistic "source_statsid", for the rel identified by heapRel and
  * heapRelid.
  *
- * Attribute numbers in expression Vars are adjusted according to attmap.
+ * stxkeys in the source statistic holds attribute numbers from the parent
+ * relation.  Those attnums, along with the attribute numbers referenced by
+ * Vars inside the expression tree, are remapped to the new relation's
+ * numbering according to attmap.
  */
 static CreateStatsStmt *
 generateClonedExtStatsStmt(RangeVar *heapRel, Oid heapRelid,
@@ -1955,7 +1968,8 @@ generateClonedExtStatsStmt(RangeVar *heapRel, Oid heapRelid,
 		StatsElem  *selem = makeNode(StatsElem);
 		AttrNumber	attnum = statsrec->stxkeys.values[i];
 
-		selem->name = get_attname(heapRelid, attnum, false);
+		selem->name =
+			get_attname(heapRelid, attmap->attnums[attnum - 1], false);
 		selem->expr = NULL;
 
 		def_names = lappend(def_names, selem);
@@ -4176,11 +4190,13 @@ transformPartitionRangeBounds(ParseState *pstate, List *blist,
 	int			i,
 				j;
 
-	i = j = 0;
+	j = 0;
 	foreach(lc, blist)
 	{
 		Node	   *expr = lfirst(lc);
 		PartitionRangeDatum *prd = NULL;
+
+		i = foreach_current_index(lc);
 
 		/*
 		 * Infinite range bounds -- "minvalue" and "maxvalue" -- get passed in
@@ -4259,7 +4275,6 @@ transformPartitionRangeBounds(ParseState *pstate, List *blist,
 			prd = makeNode(PartitionRangeDatum);
 			prd->kind = PARTITION_RANGE_DATUM_VALUE;
 			prd->value = (Node *) value;
-			++i;
 		}
 
 		prd->location = exprLocation(expr);

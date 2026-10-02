@@ -39,6 +39,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
+#include "commands/async.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
@@ -619,7 +620,15 @@ vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 
 			if (params->options & VACOPT_VACUUM)
 			{
-				if (!vacuum_rel(vrel->oid, vrel->relation, params, bstrategy))
+				VacuumParams params_copy;
+
+				/*
+				 * vacuum_rel() scribbles on the parameters, so give it a copy
+				 * to avoid affecting other relations.
+				 */
+				memcpy(&params_copy, params, sizeof(VacuumParams));
+
+				if (!vacuum_rel(vrel->oid, vrel->relation, &params_copy, bstrategy))
 					continue;
 			}
 
@@ -1167,7 +1176,7 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		ereport(WARNING,
 				(errmsg("cutoff for freezing multixacts is far in the past"),
 				 errhint("Close open transactions soon to avoid wraparound problems.\n"
-						 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));
+						 "You might also need to commit or roll back old prepared transactions.")));
 
 	/*
 	 * Determine the minimum freeze age to use: as specified by the caller, or
@@ -1935,6 +1944,12 @@ vac_truncate_clog(TransactionId frozenXID,
 	}
 
 	/*
+	 * Freeze any old transaction IDs in the async notification queue before
+	 * CLOG truncation.
+	 */
+	AsyncNotifyFreezeXids(frozenXID);
+
+	/*
 	 * Advance the oldest value for commit timestamps before truncating, so
 	 * that if a user requests a timestamp for a transaction we're truncating
 	 * away right after this point, they get NULL instead of an ugly "file not
@@ -1993,8 +2008,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
+	VacuumParams toast_vacuum_params;
 
 	Assert(params != NULL);
+
+	/*
+	 * This function scribbles on the parameters, so make a copy early to
+	 * avoid affecting the TOAST table (if we do end up recursing to it).
+	 */
+	memcpy(&toast_vacuum_params, params, sizeof(VacuumParams));
 
 	/* Begin a transaction for vacuuming this relation */
 	StartTransactionCommand();
@@ -2258,10 +2280,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 	 */
 	if (toast_relid != InvalidOid)
 	{
-		VacuumParams toast_vacuum_params;
-
 		/* force VACOPT_PROCESS_MAIN so vacuum_rel() processes it */
-		memcpy(&toast_vacuum_params, params, sizeof(VacuumParams));
 		toast_vacuum_params.options |= VACOPT_PROCESS_MAIN;
 
 		vacuum_rel(toast_relid, NULL, &toast_vacuum_params, bstrategy);

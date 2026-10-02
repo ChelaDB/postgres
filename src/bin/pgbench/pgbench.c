@@ -3025,7 +3025,14 @@ commandFailed(CState *st, const char *cmd, const char *message)
 static void
 commandError(CState *st, const char *message)
 {
-	Assert(sql_script[st->use_file].commands[st->command]->type == SQL_COMMAND);
+	/*
+	 * Errors should only be detected during an SQL command or the
+	 * \endpipeline meta command. Any other case triggers an assertion
+	 * failure.
+	 */
+	Assert(sql_script[st->use_file].commands[st->command]->type == SQL_COMMAND ||
+		   sql_script[st->use_file].commands[st->command]->meta == META_ENDPIPELINE);
+
 	pg_log_info("client %d got an error in command %d (SQL) of script %d; %s",
 				st->id, st->command, st->use_file, message);
 }
@@ -3313,8 +3320,22 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				pg_log_debug("client %d pipeline ending", st->id);
 				if (PQexitPipelineMode(st->con) != 1)
 					pg_log_error("client %d failed to exit pipeline mode: %s", st->id,
-								 PQerrorMessage(st->con));
+								 PQresultErrorMessage(res));
 				break;
+
+			case PGRES_COPY_IN:
+			case PGRES_COPY_OUT:
+			case PGRES_COPY_BOTH:
+				pg_log_error("COPY is not supported in pgbench, aborting");
+
+				/*
+				 * We need to exit the copy state.  Otherwise, PQgetResult()
+				 * will always return an empty PGresult as an effect of
+				 * getCopyResult(), leading to an infinite loop in the error
+				 * cleanup done below.
+				 */
+				PQendcopy(st->con);
+				goto error;
 
 			case PGRES_NONFATAL_ERROR:
 			case PGRES_FATAL_ERROR:
@@ -3323,7 +3344,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				if (canRetryError(st->estatus))
 				{
 					if (verbose_errors)
-						commandError(st, PQerrorMessage(st->con));
+						commandError(st, PQresultErrorMessage(res));
 					goto error;
 				}
 				/* fall through */
@@ -3332,7 +3353,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				/* anything else is unexpected */
 				pg_log_error("client %d script %d aborted in command %d query %d: %s",
 							 st->id, st->use_file, st->command, qrynum,
-							 PQerrorMessage(st->con));
+							 PQresultErrorMessage(res));
 				goto error;
 		}
 
@@ -3459,6 +3480,8 @@ doRetry(CState *st, pg_time_usec_t *now)
 static int
 discardUntilSync(CState *st)
 {
+	bool		received_sync = false;
+
 	/* send a sync */
 	if (!PQpipelineSync(st->con))
 	{
@@ -3473,10 +3496,16 @@ discardUntilSync(CState *st)
 		PGresult   *res = PQgetResult(st->con);
 
 		if (PQresultStatus(res) == PGRES_PIPELINE_SYNC)
+			received_sync = true;
+		else if (received_sync)
 		{
-			PQclear(res);
-			res = PQgetResult(st->con);
+			/*
+			 * PGRES_PIPELINE_SYNC must be followed by another
+			 * PGRES_PIPELINE_SYNC or NULL; otherwise, assert failure.
+			 */
 			Assert(res == NULL);
+
+			PQclear(res);
 			break;
 		}
 		PQclear(res);
@@ -3536,22 +3565,19 @@ getTransactionStatus(PGconn *con)
 static void
 printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 {
-	static PQExpBuffer buf = NULL;
+	PQExpBufferData buf;
 
-	if (buf == NULL)
-		buf = createPQExpBuffer();
-	else
-		resetPQExpBuffer(buf);
+	initPQExpBuffer(&buf);
 
-	printfPQExpBuffer(buf, "client %d ", st->id);
-	appendPQExpBufferStr(buf, (is_retry ?
-							   "repeats the transaction after the error" :
-							   "ends the failed transaction"));
-	appendPQExpBuffer(buf, " (try %u", st->tries);
+	printfPQExpBuffer(&buf, "client %d ", st->id);
+	appendPQExpBufferStr(&buf, (is_retry ?
+								"repeats the transaction after the error" :
+								"ends the failed transaction"));
+	appendPQExpBuffer(&buf, " (try %u", st->tries);
 
 	/* Print max_tries if it is not unlimited. */
 	if (max_tries)
-		appendPQExpBuffer(buf, "/%u", max_tries);
+		appendPQExpBuffer(&buf, "/%u", max_tries);
 
 	/*
 	 * If the latency limit is used, print a percentage of the current
@@ -3560,12 +3586,14 @@ printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 	if (latency_limit)
 	{
 		pg_time_now_lazy(now);
-		appendPQExpBuffer(buf, ", %.3f%% of the maximum time of tries was used",
+		appendPQExpBuffer(&buf, ", %.3f%% of the maximum time of tries was used",
 						  (100.0 * (*now - st->txn_scheduled) / latency_limit));
 	}
-	appendPQExpBufferStr(buf, ")\n");
+	appendPQExpBufferStr(&buf, ")\n");
 
-	pg_log_info("%s", buf->data);
+	pg_log_info("%s", buf.data);
+
+	termPQExpBuffer(&buf);
 }
 
 /*
@@ -6120,7 +6148,7 @@ findBuiltin(const char *name)
 static int
 parseScriptWeight(const char *option, char **script)
 {
-	char	   *sep;
+	const char *sep;
 	int			weight;
 
 	if ((sep = strrchr(option, WSEP)))
@@ -6716,7 +6744,7 @@ main(int argc, char **argv)
 				break;
 			case 'c':
 				benchmarking_option_set = true;
-				if (!option_parse_int(optarg, "-c/--clients", 1, INT_MAX,
+				if (!option_parse_int(optarg, "-c/--client", 1, INT_MAX,
 									  &nclients))
 				{
 					exit(1);

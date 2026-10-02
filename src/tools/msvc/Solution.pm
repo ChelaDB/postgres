@@ -238,6 +238,7 @@ sub GenerateFiles
 		HAVE_DECL_LLVMGETHOSTCPUNAME => 0,
 		HAVE_DECL_LLVMGETHOSTCPUFEATURES => 0,
 		HAVE_DECL_LLVMORCGETSYMBOLADDRESSIN => 0,
+		HAVE_DECL_MEMSET_S => 0,
 		HAVE_DECL_POSIX_FADVISE => 0,
 		HAVE_DECL_PREADV => 0,
 		HAVE_DECL_PWRITEV => 0,
@@ -245,6 +246,7 @@ sub GenerateFiles
 		HAVE_DECL_STRLCAT => 0,
 		HAVE_DECL_STRLCPY => 0,
 		HAVE_DECL_STRNLEN => 1,
+		HAVE_DECL_TIMINGSAFE_BCMP => 0,
 		HAVE_EDITLINE_HISTORY_H => undef,
 		HAVE_EDITLINE_READLINE_H => undef,
 		HAVE_EXECINFO_H => undef,
@@ -302,7 +304,6 @@ sub GenerateFiles
 		HAVE_MBARRIER_H => undef,
 		HAVE_MBSTOWCS_L => 1,
 		HAVE_MEMORY_H => 1,
-		HAVE_MEMSET_S => undef,
 		HAVE_MKDTEMP => undef,
 		HAVE_OPENSSL_INIT_SSL => undef,
 		HAVE_OSSP_UUID_H => undef,
@@ -356,6 +357,7 @@ sub GenerateFiles
 		HAVE_SYS_TYPES_H => 1,
 		HAVE_SYS_UCRED_H => undef,
 		HAVE_TERMIOS_H => undef,
+		HAVE_TIMINGSAFE_BCMP => undef,
 		HAVE_TYPEOF => undef,
 		HAVE_UCRED_H => undef,
 		HAVE_UINT64 => undef,
@@ -399,13 +401,14 @@ sub GenerateFiles
 		PACKAGE_TARNAME => lc qq{"$package_name"},
 		PACKAGE_URL => qq{"$package_url"},
 		PACKAGE_VERSION => qq{"$package_version"},
+		PG_CXX_PRINTF_ATTRIBUTE => undef,
+		PG_C_PRINTF_ATTRIBUTE => undef,
 		PG_INT128_TYPE => undef,
 		PG_INT64_TYPE => 'long long int',
 		PG_KRB_SRVNAM => qq{"postgres"},
 		PG_MAJORVERSION => qq{"$majorver"},
 		PG_MAJORVERSION_NUM => $majorver,
 		PG_MINORVERSION_NUM => $minorver,
-		PG_PRINTF_ATTRIBUTE => undef,
 		PG_USE_STDBOOL => 1,
 		PG_VERSION => qq{"$package_version$extraver"},
 		PG_VERSION_NUM => sprintf("%d%04d", $majorver, $minorver),
@@ -1328,6 +1331,34 @@ sub new
 	$self->{vcver} = '17.00';
 	$self->{visualStudioName} = 'Visual Studio 2022';
 	$self->{VisualStudioVersion} = '17.0.31903.59';
+	$self->{MinimumVisualStudioVersion} = '10.0.40219.1';
+
+	return $self;
+}
+
+package VS2026Solution;
+
+#
+# Package that encapsulates a Visual Studio 2026 solution file
+#
+
+use Carp;
+use strict;
+use warnings;
+use base qw(Solution);
+
+no warnings qw(redefine);    ## no critic
+
+sub new
+{
+	my $classname = shift;
+	my $self      = $classname->SUPER::_new(@_);
+	bless($self, $classname);
+
+	$self->{solutionFileVersion}        = '12.00';
+	$self->{vcver}                      = '18.00';
+	$self->{visualStudioName}           = 'Visual Studio 2026';
+	$self->{VisualStudioVersion}        = '18.7.11925.98';
 	$self->{MinimumVisualStudioVersion} = '10.0.40219.1';
 
 	return $self;
