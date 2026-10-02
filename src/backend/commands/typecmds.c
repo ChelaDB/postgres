@@ -132,7 +132,8 @@ static void checkEnumOwner(HeapTuple tup);
 static char *domainAddConstraint(Oid domainOid, Oid domainNamespace,
 								 Oid baseTypeOid,
 								 int typMod, Constraint *constr,
-								 const char *domainName, ObjectAddress *constrAddr);
+								 const char *domainName, ObjectAddress *constrAddr,
+								 bool is_readd);
 static Node *replace_domain_constraint_value(ParseState *pstate,
 											 ColumnRef *cref);
 static void AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
@@ -1013,6 +1014,13 @@ DefineDomain(CreateDomainStmt *stmt)
 		}
 	}
 
+	/*
+	 * The below call to TypeCreate() calls GenerateTypeDependencies(), which
+	 * adds the dependencies on types.  We are responsible for checking USAGE.
+	 */
+	if (defaultValueBin)
+		CheckUsageOnTypesInExpr(stringToNode(defaultValueBin), NIL, GetUserId());
+
 	/* Allocate OID for array type */
 	domainArrayOid = AssignTypeArrayOid();
 
@@ -1110,7 +1118,7 @@ DefineDomain(CreateDomainStmt *stmt)
 			case CONSTR_CHECK:
 				domainAddConstraint(address.objectId, domainNamespace,
 									basetypeoid, basetypeMod,
-									constr, domainName, NULL);
+									constr, domainName, NULL, false);
 				break;
 
 				/* Other constraint types were fully processed above */
@@ -1484,6 +1492,10 @@ DefineRange(CreateRangeStmt *stmt)
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("range subtype cannot be %s",
 						format_type_be(rangeSubtype))));
+
+	aclresult = pg_type_aclcheck(rangeSubtype, GetUserId(), ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error_type(aclresult, rangeSubtype);
 
 	/* Identify subopclass */
 	rangeSubOpclass = findRangeSubOpclass(rangeSubOpclassName, rangeSubtype);
@@ -2656,6 +2668,12 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 		else
 		{
 			/*
+			 * The below call to GenerateTypeDependencies() creates the
+			 * dependencies on types.  We are responsible for checking USAGE.
+			 */
+			CheckUsageOnTypesInExpr(defaultExpr, NIL, GetUserId());
+
+			/*
 			 * Expression must be stored as a nodeToString result, but we also
 			 * require a valid textual representation (mainly to make life
 			 * easier for pg_dump).
@@ -2938,7 +2956,7 @@ AlterDomainDropConstraint(List *names, const char *constrName,
  */
 ObjectAddress
 AlterDomainAddConstraint(List *names, Node *newConstraint,
-						 ObjectAddress *constrAddr)
+						 ObjectAddress *constrAddr, bool is_readd)
 {
 	TypeName   *typename;
 	Oid			domainoid;
@@ -3023,7 +3041,8 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 
 	ccbin = domainAddConstraint(domainoid, typTup->typnamespace,
 								typTup->typbasetype, typTup->typtypmod,
-								constr, NameStr(typTup->typname), constrAddr);
+								constr, NameStr(typTup->typname), constrAddr,
+								is_readd);
 
 	/*
 	 * If requested to validate the constraint, test all values stored in the
@@ -3466,7 +3485,8 @@ checkDomainOwner(HeapTuple tup)
 static char *
 domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 					int typMod, Constraint *constr,
-					const char *domainName, ObjectAddress *constrAddr)
+					const char *domainName, ObjectAddress *constrAddr,
+					bool is_readd)
 {
 	Node	   *expr;
 	char	   *ccbin;
@@ -3526,6 +3546,13 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 	 * Fix up collation information.
 	 */
 	assign_expr_collations(pstate, expr);
+
+	/*
+	 * The below call to CreateConstraintEntry() creates the dependencies on
+	 * types.  We are responsible for checking USAGE.
+	 */
+	if (!is_readd)
+		CheckUsageOnTypesInExpr(expr, NIL, GetUserId());
 
 	/*
 	 * Domains don't allow variables (this is probably dead code now that
