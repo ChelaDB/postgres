@@ -165,6 +165,10 @@ extern void recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 
 extern ObjectClass getObjectClass(const ObjectAddress *object);
 
+extern void CheckUsageOnTypesInExpr(Node *expr, List *rtable, Oid roleid);
+
+extern void CheckUsageOnTypesInSingleRelExpr(Node *expr, Oid relId, Oid roleid);
+
 extern ObjectAddresses *new_object_addresses(void);
 
 extern void add_exact_object_address(const ObjectAddress *object,
@@ -219,6 +223,8 @@ extern long changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
 
 extern Oid	getExtensionOfObject(Oid classId, Oid objectId);
 extern List *getAutoExtensionsOfObject(Oid classId, Oid objectId);
+
+extern Oid	getExtensionType(Oid extensionOid, const char *typname);
 
 extern bool sequenceIsOwned(Oid seqId, char deptype, Oid *tableId, int32 *colId);
 extern List *getOwnedSequences(Oid relid);

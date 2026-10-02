@@ -631,9 +631,15 @@ slot_store_data(TupleTableSlot *slot, LogicalRepRelMapEntry *rel,
 
 		if (!att->attisdropped && remoteattnum >= 0)
 		{
-			StringInfo	colvalue = &tupleData->colvalues[remoteattnum];
+			StringInfo	colvalue;
 
-			Assert(remoteattnum < tupleData->ncols);
+			if (remoteattnum >= tupleData->ncols)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+								remoteattnum + 1, tupleData->ncols)));
+
+			colvalue = &tupleData->colvalues[remoteattnum];
 
 			/* Set attnum for error callback */
 			apply_error_callback_arg.remote_attnum = remoteattnum;
@@ -744,7 +750,11 @@ slot_modify_data(TupleTableSlot *slot, TupleTableSlot *srcslot,
 		if (remoteattnum < 0)
 			continue;
 
-		Assert(remoteattnum < tupleData->ncols);
+		if (remoteattnum >= tupleData->ncols)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+							remoteattnum + 1, tupleData->ncols)));
 
 		if (tupleData->colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
 		{
@@ -1845,7 +1855,12 @@ apply_handle_update(StringInfo s)
 
 		if (!att->attisdropped && remoteattnum >= 0)
 		{
-			Assert(remoteattnum < newtup.ncols);
+			if (remoteattnum >= newtup.ncols)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+								remoteattnum + 1, newtup.ncols)));
+
 			if (newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
 				target_rte->updatedCols =
 					bms_add_member(target_rte->updatedCols,
@@ -3672,6 +3687,13 @@ ApplyWorkerMain(Datum main_arg)
 	StartTransactionCommand();
 	oldctx = MemoryContextSwitchTo(ApplyContext);
 
+	/*
+	 * Lock the subscription to prevent it from being concurrently dropped,
+	 * then re-verify its existence. After the initialization, the worker will
+	 * be terminated gracefully if the subscription is dropped.
+	 */
+	LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid, 0,
+					 AccessShareLock);
 	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true);
 	if (!MySubscription)
 	{
@@ -3714,10 +3736,6 @@ ApplyWorkerMain(Datum main_arg)
 						MySubscription->name)));
 
 	CommitTransactionCommand();
-
-	/* Connect to the origin and start the replication. */
-	elog(DEBUG1, "connecting to publisher using connection string \"%s\"",
-		 MySubscription->conninfo);
 
 	if (am_tablesync_worker())
 	{
@@ -3828,8 +3846,16 @@ ApplyWorkerMain(Datum main_arg)
 			walrcv_startstreaming(LogRepWorkerWalRcvConn, &options);
 
 			StartTransactionCommand();
+
+			/*
+			 * Updating pg_subscription might involve TOAST table access, so
+			 * ensure we have a valid snapshot.
+			 */
+			PushActiveSnapshot(GetTransactionSnapshot());
+
 			UpdateTwoPhaseState(MySubscription->oid, LOGICALREP_TWOPHASE_STATE_ENABLED);
 			MySubscription->twophasestate = LOGICALREP_TWOPHASE_STATE_ENABLED;
+			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
 		else
@@ -3882,7 +3908,15 @@ DisableSubscriptionAndExit(void)
 
 	/* Disable the subscription */
 	StartTransactionCommand();
+
+	/*
+	 * Updating pg_subscription might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
 	DisableSubscription(MySubscription->oid);
+	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	/* Notify the subscription has been disabled and exit */
@@ -3974,6 +4008,12 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 	}
 
 	/*
+	 * Updating pg_subscription might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/*
 	 * Protect subskiplsn of pg_subscription from being concurrently updated
 	 * while clearing it.
 	 */
@@ -4030,6 +4070,8 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 
 	heap_freetuple(tup);
 	table_close(rel, NoLock);
+
+	PopActiveSnapshot();
 
 	if (started_tx)
 		CommitTransactionCommand();

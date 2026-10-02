@@ -577,6 +577,7 @@ DisableTimeoutParams
 DiscardMode
 DiscardStmt
 DistanceValue
+DistinctColInfo
 DistinctExpr
 DoStmt
 DocRepresentation
@@ -709,6 +710,7 @@ ExtensibleNodeEntry
 ExtensibleNodeMethods
 ExtensionControlFile
 ExtensionInfo
+ExtensionSiblingCache
 ExtensionVersionInfo
 FDWCollateState
 FD_SET
@@ -1184,6 +1186,7 @@ InternalGrant
 Interval
 IntoClause
 InvalMessageArray
+InvalidationInfo
 InvalidationMsgsGroup
 IpcMemoryId
 IpcMemoryKey
@@ -2127,6 +2130,7 @@ PsqlScanQuoteType
 PsqlScanResult
 PsqlScanState
 PsqlScanStateData
+PsqlScanStateSave
 PsqlSettings
 Publication
 PublicationActions

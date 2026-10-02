@@ -80,6 +80,7 @@
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walwriter.h"
+#include "replication/logical.h"
 #include "replication/logicallauncher.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
@@ -4799,6 +4800,17 @@ static struct config_string ConfigureNamesString[] =
 		&restrict_nonsystem_relation_kind_string,
 		"",
 		check_restrict_nonsystem_relation_kind, assign_restrict_nonsystem_relation_kind, NULL
+	},
+
+	{
+		{"output_plugin_libraries", PGC_SUSET, REPLICATION_SENDING,
+			gettext_noop("Lists libraries that may be named as logical decoding output plugins."),
+			gettext_noop("Users with REPLICATION privileges may only use plugins in this list when creating logical replication slots."),
+			GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY
+		},
+		&output_plugin_libraries_string,
+		"pgoutput, test_decoding",
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -11899,6 +11911,7 @@ validate_option_array_item(const char *name, const char *value,
 
 {
 	struct config_generic *gconf;
+	bool		reset_custom;
 
 	/*
 	 * There are three cases to consider:
@@ -11917,16 +11930,21 @@ validate_option_array_item(const char *name, const char *value,
 	 * it's assumed to be fully validated.)
 	 *
 	 * name is not known and can't be created as a placeholder.  Throw error,
-	 * unless skipIfNoPermissions is true, in which case return false.
+	 * unless skipIfNoPermissions or reset_custom is true.  If reset_custom is
+	 * true, this is a RESET or RESET ALL operation for an unknown custom GUC
+	 * with a reserved prefix, in which case we want to fall through to the
+	 * placeholder case described in the preceding paragraph (else there'd be
+	 * no way for users to remove them).  Otherwise, return false.
 	 */
-	gconf = find_option(name, true, skipIfNoPermissions, ERROR);
-	if (!gconf)
+	reset_custom = (!value && valid_custom_variable_name(name));
+	gconf = find_option(name, true, skipIfNoPermissions || reset_custom, ERROR);
+	if (!gconf && !reset_custom)
 	{
 		/* not known, failed to make a placeholder */
 		return false;
 	}
 
-	if (gconf->flags & GUC_CUSTOM_PLACEHOLDER)
+	if (!gconf || gconf->flags & GUC_CUSTOM_PLACEHOLDER)
 	{
 		/*
 		 * We cannot do any meaningful check on the value, so only permissions
@@ -13116,9 +13134,20 @@ assign_recovery_target_lsn(const char *newval, void *extra)
 static bool
 check_primary_slot_name(char **newval, void **extra, GucSource source)
 {
+	int			err_code;
+	char	   *err_msg = NULL;
+	char	   *err_hint = NULL;
+
 	if (*newval && strcmp(*newval, "") != 0 &&
-		!ReplicationSlotValidateName(*newval, WARNING))
+		!ReplicationSlotValidateNameInternal(*newval, &err_code, &err_msg,
+											 &err_hint))
+	{
+		GUC_check_errcode(err_code);
+		GUC_check_errdetail("%s", err_msg);
+		if (err_hint != NULL)
+			GUC_check_errhint("%s", err_hint);
 		return false;
+	}
 
 	return true;
 }

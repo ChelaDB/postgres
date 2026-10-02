@@ -690,6 +690,10 @@ UpdateIndexRelation(Oid indexoid,
  *			already exists.
  *		INDEX_CREATE_PARTITIONED:
  *			create a partitioned index (table must be partitioned)
+ *		INDEX_CREATE_DEFERRABLE:
+ *			index supports a deferrable constraint, mark it as
+ *			non-immediate (indimmediate = false).
+ *
  * constr_flags: flags passed to index_constraint_create
  *		(only if INDEX_CREATE_ADD_CONSTRAINT is set)
  * allow_system_table_mods: allow table to be a system catalog
@@ -697,6 +701,9 @@ UpdateIndexRelation(Oid indexoid,
  * constraintId: if not NULL, receives OID of created constraint
  *
  * Returns the OID of the created index.
+ *
+ * NB: Caller is responsible for ensuring the user has USAGE on all types
+ * indexInfo->ii_{Expressions,Predicate} depend on.
  */
 Oid
 index_create(Relation heapRelation,
@@ -1020,7 +1027,8 @@ index_create(Relation heapRelation,
 						indexInfo,
 						collationObjectId, classObjectId, coloptions,
 						isprimary, is_exclusion,
-						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0,
+						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0 &&
+						(flags & INDEX_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
 						!concurrent);
 
@@ -1291,6 +1299,8 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 	List	   *indexColNames = NIL;
 	List	   *indexExprs = NIL;
 	List	   *indexPreds = NIL;
+	bits16		flags = INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT;
+	Form_pg_index indexForm;
 
 	indexRelation = index_open(oldIndexId, RowExclusiveLock);
 
@@ -1310,6 +1320,13 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(oldIndexId));
 	if (!HeapTupleIsValid(indexTuple))
 		elog(ERROR, "cache lookup failed for index %u", oldIndexId);
+
+	indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+
+	/* Old index is deferrable, do the same for the new index */
+	if (!indexForm->indimmediate)
+		flags |= INDEX_CREATE_DEFERRABLE;
+
 	indclassDatum = SysCacheGetAttr(INDEXRELID, indexTuple,
 									Anum_pg_index_indclass, &isnull);
 	Assert(!isnull);
@@ -1419,8 +1436,8 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 							  indclass->values,
 							  indcoloptions->values,
 							  optionDatum,
-							  INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT,
-							  0,
+							  flags,
+							  0,	/* constr_flags */
 							  true, /* allow table to be a system catalog? */
 							  false,	/* is_internal? */
 							  NULL);
@@ -2920,12 +2937,19 @@ index_update_stats(Relation rel,
 	if (dirty)
 	{
 		systable_inplace_update_finish(state, tuple);
-		/* the above sends a cache inval message */
+		/* the above sends transactional and immediate cache inval messages */
 	}
 	else
 	{
 		systable_inplace_update_cancel(state);
-		/* no need to change tuple, but force relcache inval anyway */
+
+		/*
+		 * While we didn't change relhasindex, CREATE INDEX needs a
+		 * transactional inval for when the new index's catalog rows become
+		 * visible.  Other CREATE INDEX and REINDEX code happens to also queue
+		 * this inval, but keep this in case rare callers rely on this part of
+		 * our API contract.
+		 */
 		CacheInvalidateRelcacheByTuple(tuple);
 	}
 
