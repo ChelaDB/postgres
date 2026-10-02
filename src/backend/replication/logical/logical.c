@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "access/xlogutils.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -41,8 +42,11 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/varlena.h"
 
 void		(*Custom_XLogReaderRoutines)(XLogReaderRoutine *xlr);
 
@@ -53,6 +57,9 @@ typedef struct LogicalErrorCallbackState
 	const char *callback_name;
 	XLogRecPtr	report_location;
 } LogicalErrorCallbackState;
+
+/* GUC variables */
+char	   *output_plugin_libraries_string;
 
 /* wrappers around output plugin callbacks */
 static void output_plugin_error_callback(void *arg);
@@ -181,7 +188,69 @@ StartupDecodingContext(List *output_plugin_options,
 	 * now.
 	 */
 	if (!fast_forward)
-		LoadOutputPlugin(&ctx->callbacks, NameStr(slot->data.plugin));
+	{
+		/*
+		 * Before loading this library, make sure it's been blessed for
+		 * logical decoding.
+		 */
+		const char *plugin = NameStr(slot->data.plugin);
+		bool		plugin_allowed = false;
+
+		if (output_plugin_libraries_string && output_plugin_libraries_string[0])
+		{
+			/* Check this plugin against output_plugin_libraries. */
+			char	   *rawstring;
+			List	   *elemlist = NIL;
+
+			/* Need a modifiable copy */
+			rawstring = pstrdup(output_plugin_libraries_string);
+
+			if (!SplitGUCList(rawstring, ',', &elemlist))
+			{
+				/* syntax error in list */
+				ereport(LOG,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid list syntax in parameter \"%s\"",
+								"output_plugin_libraries")));
+
+				list_free(elemlist);
+				elemlist = NIL;
+			}
+
+			foreach_ptr(char, allowed, elemlist)
+			{
+				if (strcmp(allowed, plugin) == 0)
+				{
+					plugin_allowed = true;
+					break;
+				}
+			}
+
+			list_free(elemlist);
+			pfree(rawstring);
+		}
+
+		if (!plugin_allowed)
+		{
+			/*
+			 * Use the same error message as check_restricted_library_name(),
+			 * but provide additional context for the DBA in the logs. (The
+			 * HINT will be sent to the client, but that's not a secret.)
+			 */
+			ereport(ERROR,
+					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					errmsg("library \"%s\" may not be used as an output plugin",
+						   plugin),
+			/*- translator: The second %s is the value of the output_plugin_libraries GUC, which may contain whitespace, commas, and double-quotes (") */
+					errdetail_log("The configuration parameter \"%s\" (currently '%s') does not name this library as a trusted output plugin.",
+								  "output_plugin_libraries",
+								  output_plugin_libraries_string),
+					errhint("If it is safe for all REPLICATION users to use this library as an output plugin, add it to \"%s\" and reload the server configuration.",
+							"output_plugin_libraries"));
+		}
+
+		LoadOutputPlugin(&ctx->callbacks, plugin);
+	}
 
 	/*
 	 * NEON: override page_read/segment_open/segment_close functions to support on-demand WAL download
@@ -411,11 +480,11 @@ CreateInitDecodingContext(const char *plugin,
 	 * without further interlock its return value might immediately be out of
 	 * date.
 	 *
-	 * So we have to acquire the ProcArrayLock to prevent computation of new
-	 * xmin horizons by other backends, get the safe decoding xid, and inform
-	 * the slot machinery about the new limit. Once that's done the
-	 * ProcArrayLock can be released as the slot machinery now is
-	 * protecting against vacuum.
+	 * So we have to acquire both the ReplicationSlotControlLock and the
+	 * ProcArrayLock to prevent concurrent computation and update of new xmin
+	 * horizons by other backends, get the safe decoding xid, and inform the
+	 * slot machinery about the new limit. Once that's done both locks can be
+	 * released as the slot machinery now is protecting against vacuum.
 	 *
 	 * Note that, temporarily, the data, not just the catalog, xmin has to be
 	 * reserved if a data snapshot is to be exported.  Otherwise the initial
@@ -428,6 +497,7 @@ CreateInitDecodingContext(const char *plugin,
 	 *
 	 * ----
 	 */
+	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
 	xmin_horizon = GetOldestSafeDecodingTransactionId(!need_full_snapshot);
@@ -442,6 +512,7 @@ CreateInitDecodingContext(const char *plugin,
 	ReplicationSlotsComputeRequiredXmin(true);
 
 	LWLockRelease(ProcArrayLock);
+	LWLockRelease(ReplicationSlotControlLock);
 
 	ReplicationSlotMarkDirty();
 	ReplicationSlotSave();
@@ -752,7 +823,9 @@ OutputPluginUpdateProgress(struct LogicalDecodingContext *ctx,
 
 /*
  * Load the output plugin, lookup its output plugin init function, and check
- * that it provides the required callbacks.
+ * that it provides the required callbacks. The caller must have checked that
+ * the current user has the necessary privileges to load the given plugin;
+ * standard LOAD restrictions are not applied here.
  */
 static void
 LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin)
@@ -1856,10 +1929,26 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 	{
 		bool		updated_xmin = false;
 		bool		updated_restart = false;
+		XLogRecPtr	restart_lsn pg_attribute_unused();
 
 		SpinLockAcquire(&MyReplicationSlot->mutex);
 
-		MyReplicationSlot->data.confirmed_flush = lsn;
+		/* remember the old restart lsn */
+		restart_lsn = MyReplicationSlot->data.restart_lsn;
+
+		/*
+		 * Prevent moving the confirmed_flush backwards, as this could lead to
+		 * data duplication issues caused by replicating already replicated
+		 * changes.
+		 *
+		 * This can happen when a client acknowledges an LSN it doesn't have
+		 * to do anything for, and thus didn't store persistently. After a
+		 * restart, the client can send the prior LSN that it stored
+		 * persistently as an acknowledgement, but we need to ignore such an
+		 * LSN. See similar case handling in CreateDecodingContext.
+		 */
+		if (lsn > MyReplicationSlot->data.confirmed_flush)
+			MyReplicationSlot->data.confirmed_flush = lsn;
 
 		/* if we're past the location required for bumping xmin, do so */
 		if (MyReplicationSlot->candidate_xmin_lsn != InvalidXLogRecPtr &&
@@ -1897,9 +1986,29 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 
 		SpinLockRelease(&MyReplicationSlot->mutex);
 
-		/* first write new xmin to disk, so we know what's up after a crash */
+		/*
+		 * First, write new xmin and restart_lsn to disk so we know what's up
+		 * after a crash.  Even when we do this, the checkpointer can see the
+		 * updated restart_lsn value in the shared memory; then, a crash can
+		 * happen before we manage to write that value to the disk.  Thus,
+		 * checkpointer still needs to make special efforts to keep WAL
+		 * segments required by the restart_lsn written to the disk.  See
+		 * CreateCheckPoint() and CreateRestartPoint() for details.
+		 */
 		if (updated_xmin || updated_restart)
 		{
+#ifdef USE_INJECTION_POINTS
+			XLogSegNo	seg1,
+						seg2;
+
+			XLByteToSeg(restart_lsn, seg1, wal_segment_size);
+			XLByteToSeg(MyReplicationSlot->data.restart_lsn, seg2, wal_segment_size);
+
+			/* trigger injection point, but only if segment changes */
+			if (seg1 != seg2)
+				INJECTION_POINT("logical-replication-slot-advance-segment");
+#endif
+
 			ReplicationSlotMarkDirty();
 			ReplicationSlotSave();
 			elog(DEBUG1, "updated xmin: %u restart: %u", updated_xmin, updated_restart);
@@ -1924,7 +2033,14 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 	else
 	{
 		SpinLockAcquire(&MyReplicationSlot->mutex);
-		MyReplicationSlot->data.confirmed_flush = lsn;
+
+		/*
+		 * Prevent moving the confirmed_flush backwards. See comments above
+		 * for the details.
+		 */
+		if (lsn > MyReplicationSlot->data.confirmed_flush)
+			MyReplicationSlot->data.confirmed_flush = lsn;
+
 		SpinLockRelease(&MyReplicationSlot->mutex);
 	}
 }

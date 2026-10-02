@@ -443,7 +443,7 @@ parse_re_flags(pg_re_flags *flags, text *opts)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid regular expression option: \"%.*s\"",
-									pg_mblen(opt_p + i), opt_p + i)));
+									pg_mblen_range(opt_p + i, opt_p + opt_len), opt_p + i)));
 					break;
 			}
 		}
@@ -673,12 +673,13 @@ textregexreplace(PG_FUNCTION_ARGS)
 	if (VARSIZE_ANY_EXHDR(opt) > 0)
 	{
 		char	   *opt_p = VARDATA_ANY(opt);
+		const char *end_p = opt_p + VARSIZE_ANY_EXHDR(opt);
 
 		if (*opt_p >= '0' && *opt_p <= '9')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid regular expression option: \"%.*s\"",
-							pg_mblen(opt_p), opt_p),
+							pg_mblen_range(opt_p, end_p), opt_p),
 					 errhint("If you meant to use regexp_replace() with a start parameter, cast the fourth argument to integer explicitly.")));
 	}
 
@@ -772,12 +773,15 @@ similar_escape_internal(text *pat_text, text *esc_text)
 			   *r;
 	int			plen,
 				elen;
+	const char *pend;
 	bool		afterescape = false;
-	bool		incharclass = false;
 	int			nquotes = 0;
+	int			bracket_depth = 0;	/* square bracket nesting level */
+	int			charclass_pos = 0;	/* position inside a character class */
 
 	p = VARDATA_ANY(pat_text);
 	plen = VARSIZE_ANY_EXHDR(pat_text);
+	pend = p + plen;
 	if (esc_text == NULL)
 	{
 		/* No ESCAPE clause provided; default to backslash as escape */
@@ -833,6 +837,17 @@ similar_escape_internal(text *pat_text, text *esc_text)
 	 * the relevant part separators in the above expansion.  If the result
 	 * of this function is used in a plain regexp match (SIMILAR TO), the
 	 * escape-double-quotes have no effect on the match behavior.
+	 *
+	 * While we don't fully validate character classes (bracket expressions),
+	 * we do need to parse them well enough to know where they end.
+	 * "charclass_pos" tracks where we are in a character class.
+	 * Its value is uninteresting when bracket_depth is 0.
+	 * But when bracket_depth > 0, it will be
+	 *   1: right after the opening '[' (a following '^' will negate
+	 *      the class, while ']' is a literal character)
+	 *   2: right after a '^' after the opening '[' (']' is still a literal
+	 *      character)
+	 *   3 or more: further inside the character class (']' ends the class)
 	 *----------
 	 */
 
@@ -866,7 +881,7 @@ similar_escape_internal(text *pat_text, text *esc_text)
 
 		if (elen > 1)
 		{
-			int			mblen = pg_mblen(p);
+			int			mblen = pg_mblen_range(p, pend);
 
 			if (mblen > 1)
 			{
@@ -904,7 +919,7 @@ similar_escape_internal(text *pat_text, text *esc_text)
 		/* fast path */
 		if (afterescape)
 		{
-			if (pchar == '"' && !incharclass)	/* escape-double-quote? */
+			if (pchar == '"' && bracket_depth < 1)	/* escape-double-quote? */
 			{
 				/* emit appropriate part separator, per notes above */
 				if (nquotes == 0)
@@ -945,6 +960,12 @@ similar_escape_internal(text *pat_text, text *esc_text)
 				 */
 				*r++ = '\\';
 				*r++ = pchar;
+
+				/*
+				 * If we encounter an escaped character in a character class,
+				 * we are no longer at the beginning.
+				 */
+				charclass_pos = 3;
 			}
 			afterescape = false;
 		}
@@ -953,18 +974,69 @@ similar_escape_internal(text *pat_text, text *esc_text)
 			/* SQL escape character; do not send to output */
 			afterescape = true;
 		}
-		else if (incharclass)
+		else if (bracket_depth > 0)
 		{
+			/* inside a character class */
 			if (pchar == '\\')
+			{
+				/*
+				 * If we're here, backslash is not the SQL escape character,
+				 * so treat it as a literal class element, which requires
+				 * doubling it.  (This matches our behavior for backslashes
+				 * outside character classes.)
+				 */
 				*r++ = '\\';
+			}
 			*r++ = pchar;
-			if (pchar == ']')
-				incharclass = false;
+
+			/* parse the character class well enough to identify ending ']' */
+			if (pchar == ']' && charclass_pos > 2)
+			{
+				/* found the real end of a bracket pair */
+				bracket_depth--;
+				/* don't reset charclass_pos, this may be an inner bracket */
+			}
+			else if (pchar == '[')
+			{
+				/* start of a nested bracket pair */
+				bracket_depth++;
+
+				/*
+				 * We are no longer at the beginning of a character class.
+				 * (The nested bracket pair is a collating element, not a
+				 * character class in its own right.)
+				 */
+				charclass_pos = 3;
+			}
+			else if (pchar == '^')
+			{
+				/*
+				 * A caret right after the opening bracket negates the
+				 * character class.  In that case, the following will
+				 * increment charclass_pos from 1 to 2, so that a following
+				 * ']' is still a literal character and does not end the
+				 * character class.  If we are further inside a character
+				 * class, charclass_pos might get incremented past 3, which is
+				 * fine.
+				 */
+				charclass_pos++;
+			}
+			else
+			{
+				/*
+				 * Anything else (including a backslash or leading ']') is an
+				 * element of the character class, so we are no longer at the
+				 * beginning of the class.
+				 */
+				charclass_pos = 3;
+			}
 		}
 		else if (pchar == '[')
 		{
+			/* start of a character class */
 			*r++ = pchar;
-			incharclass = true;
+			bracket_depth = 1;
+			charclass_pos = 1;
 		}
 		else if (pchar == '%')
 		{
@@ -1440,7 +1512,7 @@ setup_regexp_matches(text *orig_str, text *pattern, pg_re_flags *re_flags,
 
 	/* convert string to pg_wchar form for matching */
 	orig_len = VARSIZE_ANY_EXHDR(orig_str);
-	wide_str = (pg_wchar *) palloc(sizeof(pg_wchar) * (orig_len + 1));
+	wide_str = palloc_array(pg_wchar, orig_len + 1);
 	wide_len = pg_mb2wchar_with_len(VARDATA_ANY(orig_str), wide_str, orig_len);
 
 	/* set up the compiled pattern */
@@ -1576,23 +1648,24 @@ setup_regexp_matches(text *orig_str, text *pattern, pg_re_flags *re_flags,
 
 	if (eml > 1)
 	{
-		int64		maxsiz = eml * (int64) maxlen;
 		int			conv_bufsiz;
 
 		/*
 		 * Make the conversion buffer large enough for any substring of
-		 * interest.
+		 * interest. We can't use the original string's byte length as a
+		 * tighter bound, because that assumes the input is validly encoded;
+		 * but pg_mb2wchar_with_len() can accept strings that are invalid in
+		 * the database encoding, and converting such a character back to
+		 * multibyte form can take more bytes than it did in the input.
 		 *
-		 * Worst case: assume we need the maximum size (maxlen*eml), but take
-		 * advantage of the fact that the original string length in bytes is
-		 * an upper bound on the byte length of any fetched substring (and we
-		 * know that len+1 is safe to allocate because the varlena header is
-		 * longer than 1 byte).
+		 * This can't overflow, nor exceed what palloc will accept: maxlen is
+		 * at most wide_len, which is at most orig_len, and we have already
+		 * successfully allocated (orig_len + 1) * sizeof(pg_wchar) bytes for
+		 * wide_str. That relies on eml being no more than sizeof(pg_wchar),
+		 * which is true of all supported encodings.
 		 */
-		if (maxsiz > orig_len)
-			conv_bufsiz = orig_len + 1;
-		else
-			conv_bufsiz = maxsiz + 1;	/* safe since maxsiz < 2^30 */
+		Assert(eml <= sizeof(pg_wchar));
+		conv_bufsiz = maxlen * eml + 1;
 
 		matchctx->conv_buf = palloc(conv_bufsiz);
 		matchctx->conv_bufsiz = conv_bufsiz;

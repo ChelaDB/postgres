@@ -454,8 +454,6 @@ CREATE VIEW atest12v AS
   SELECT * FROM atest12 WHERE b <<< 5;
 CREATE VIEW atest12sbv WITH (security_barrier=true) AS
   SELECT * FROM atest12 WHERE b <<< 5;
-GRANT SELECT ON atest12v TO PUBLIC;
-GRANT SELECT ON atest12sbv TO PUBLIC;
 -- This plan should use nestloop, knowing that few rows will be selected.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
                    QUERY PLAN                    
@@ -501,9 +499,18 @@ CREATE FUNCTION leak2(integer,integer) RETURNS boolean
   LANGUAGE plpgsql immutable;
 CREATE OPERATOR >>> (procedure = leak2, leftarg = integer, rightarg = integer,
                      restrict = scalargtsel);
--- This should not show any "leak" notices before failing.
+-- These should not show any "leak" notices before failing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12 WHERE a >>> 0;
 ERROR:  permission denied for table atest12
+EXPLAIN (COSTS OFF) SELECT * FROM atest12v WHERE a >>> 0;
+ERROR:  permission denied for view atest12v
+EXPLAIN (COSTS OFF) SELECT * FROM atest12sbv WHERE a >>> 0;
+ERROR:  permission denied for view atest12sbv
+-- Now regress_priv_user1 grants access to regress_priv_user2 via the views.
+SET SESSION AUTHORIZATION regress_priv_user1;
+GRANT SELECT ON atest12v TO PUBLIC;
+GRANT SELECT ON atest12sbv TO PUBLIC;
+SET SESSION AUTHORIZATION regress_priv_user2;
 -- These plans should continue to use a nestloop, since they execute with the
 -- privileges of the view owner.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
@@ -1314,15 +1321,22 @@ CREATE CAST (priv_testdomain1 AS priv_testdomain3a) WITH FUNCTION castfunc(int);
 ERROR:  permission denied for type priv_testdomain1
 DROP FUNCTION castfunc(int) CASCADE;
 DROP DOMAIN priv_testdomain3a;
+CREATE DOMAIN priv_testdomain4a AS int CHECK (VALUE > ('(0,1)'::priv_testtype1).a);
+ERROR:  permission denied for type priv_testtype1
 CREATE FUNCTION priv_testfunc5a(a priv_testdomain1) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$;
 ERROR:  permission denied for type priv_testdomain1
 CREATE FUNCTION priv_testfunc6a(b int) RETURNS priv_testdomain1 LANGUAGE SQL AS $$ SELECT $1::priv_testdomain1 $$;
 ERROR:  permission denied for type priv_testdomain1
+CREATE FUNCTION priv_testfunc7a(a int DEFAULT ('(0,1)'::priv_testtype1).a) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$;
+ERROR:  permission denied for type priv_testtype1
 CREATE OPERATOR !+! (PROCEDURE = int4pl, LEFTARG = priv_testdomain1, RIGHTARG = priv_testdomain1);
 ERROR:  permission denied for type priv_testdomain1
 CREATE TABLE test5a (a int, b priv_testdomain1);
 ERROR:  permission denied for type priv_testdomain1
 CREATE TABLE test6a OF priv_testtype1;
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test6a2 (a int, b text);
+ALTER TABLE test6a2 OF priv_testtype1;
 ERROR:  permission denied for type priv_testtype1
 CREATE TABLE test10a (a int[], b priv_testtype1[]);
 ERROR:  permission denied for type priv_testtype1
@@ -1331,6 +1345,8 @@ ALTER TABLE test9a ADD COLUMN c priv_testdomain1;
 ERROR:  permission denied for type priv_testdomain1
 ALTER TABLE test9a ALTER COLUMN b TYPE priv_testdomain1;
 ERROR:  permission denied for type priv_testdomain1
+CREATE INDEX ON test9a ((a::priv_testdomain1));
+ERROR:  permission denied for type public.priv_testdomain1
 CREATE TYPE test7a AS (a int, b priv_testdomain1);
 ERROR:  permission denied for type priv_testdomain1
 CREATE TYPE test8a AS (a int, b int);
@@ -1338,9 +1354,21 @@ ALTER TYPE test8a ADD ATTRIBUTE c priv_testdomain1;
 ERROR:  permission denied for type priv_testdomain1
 ALTER TYPE test8a ALTER ATTRIBUTE b TYPE priv_testdomain1;
 ERROR:  permission denied for type priv_testdomain1
+CREATE DOMAIN priv_testdomain5a AS test8a CHECK ((VALUE).a > 0 AND ('(0,1)'::priv_testtype1).a >= 0);
+ERROR:  permission denied for type priv_testtype1
 CREATE TABLE test11a AS (SELECT 1::priv_testdomain1 AS a);
 ERROR:  permission denied for type priv_testdomain1
+CREATE VIEW test16a AS SELECT ('(0,1)'::priv_testtype1).a;
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test17a (a int) PARTITION BY RANGE ((a + ('(0,1)'::priv_testtype1).a));
+ERROR:  permission denied for type priv_testtype1
+CREATE POLICY priv_testpolicy1a ON test9a USING (('(0,1)'::priv_testtype1).a > 0);
+ERROR:  permission denied for type priv_testtype1
 REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test12 (c int DEFAULT 0 CHECK (c > 0 AND '(0,1)'::priv_testtype1 IS NOT NULL));
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test13 (c int DEFAULT ('(0,1)'::priv_testtype1).a);
 ERROR:  permission denied for type priv_testtype1
 SET SESSION AUTHORIZATION regress_priv_user2;
 -- commands that should succeed
@@ -1350,30 +1378,57 @@ CREATE DOMAIN priv_testdomain3b AS int;
 CREATE FUNCTION castfunc(int) RETURNS priv_testdomain3b AS $$ SELECT $1::priv_testdomain3b $$ LANGUAGE SQL;
 CREATE CAST (priv_testdomain1 AS priv_testdomain3b) WITH FUNCTION castfunc(int);
 WARNING:  cast will be ignored because the source data type is a domain
+CREATE DOMAIN priv_testdomain4b AS int CHECK (VALUE > ('(0,1)'::priv_testtype1).a);
 CREATE FUNCTION priv_testfunc5b(a priv_testdomain1) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$;
 CREATE FUNCTION priv_testfunc6b(b int) RETURNS priv_testdomain1 LANGUAGE SQL AS $$ SELECT $1::priv_testdomain1 $$;
+CREATE FUNCTION priv_testfunc7b(a int DEFAULT ('(0,1)'::priv_testtype1).a) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$;
 CREATE OPERATOR !! (PROCEDURE = priv_testfunc5b, RIGHTARG = priv_testdomain1);
 CREATE TABLE test5b (a int, b priv_testdomain1);
 CREATE TABLE test6b OF priv_testtype1;
+CREATE TABLE test6b2 (a int, b text);
+ALTER TABLE test6b2 OF priv_testtype1;
 CREATE TABLE test10b (a int[], b priv_testtype1[]);
 CREATE TABLE test9b (a int, b int);
 ALTER TABLE test9b ADD COLUMN c priv_testdomain1;
 ALTER TABLE test9b ALTER COLUMN b TYPE priv_testdomain1;
+CREATE INDEX ON test9b ((a::priv_testdomain1));
 CREATE TYPE test7b AS (a int, b priv_testdomain1);
 CREATE TYPE test8b AS (a int, b int);
 ALTER TYPE test8b ADD ATTRIBUTE c priv_testdomain1;
 ALTER TYPE test8b ALTER ATTRIBUTE b TYPE priv_testdomain1;
+CREATE DOMAIN priv_testdomain5b AS test8b CHECK ((VALUE).a > 0 AND ('(0,1)'::priv_testtype1).a >= 0);
 CREATE TABLE test11b AS (SELECT 1::priv_testdomain1 AS a);
+CREATE VIEW test16b AS SELECT ('(0,1)'::priv_testtype1).a;
+CREATE TABLE test17b (a int) PARTITION BY RANGE ((a + ('(0,1)'::priv_testtype1).a));
+CREATE POLICY priv_testpolicy1b ON test9b USING (('(0,1)'::priv_testtype1).a > 0);
 REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
 WARNING:  no privileges could be revoked for "priv_testtype1"
+CREATE TABLE test12 (c int DEFAULT 0 CHECK (c > 0 AND '(0,1)'::priv_testtype1 IS NOT NULL));
+CREATE TABLE test13 (c int DEFAULT ('(0,1)'::priv_testtype1).a);
+-- new stored expressions require USAGE on types, rebuilds do not
+\c -
+REVOKE USAGE ON TYPE priv_testtype1 FROM regress_priv_user2;
+SET SESSION AUTHORIZATION regress_priv_user2;
+ALTER TABLE test12 ALTER COLUMN c TYPE bigint;
+ALTER TYPE test8b ALTER ATTRIBUTE a TYPE bigint CASCADE;
+ALTER TABLE test12 ALTER COLUMN c SET DEFAULT ('(0,1)'::priv_testtype1).a;
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test14 (LIKE test12 INCLUDING CONSTRAINTS);
+ERROR:  permission denied for type priv_testtype1
+CREATE TABLE test15 (LIKE test13 INCLUDING DEFAULTS);
+ERROR:  permission denied for type priv_testtype1
 \c -
 DROP AGGREGATE priv_testagg1b(priv_testdomain1);
 DROP DOMAIN priv_testdomain2b;
+DROP DOMAIN priv_testdomain4b;
+DROP DOMAIN priv_testdomain5b;
 DROP OPERATOR !! (NONE, priv_testdomain1);
 DROP FUNCTION priv_testfunc5b(a priv_testdomain1);
 DROP FUNCTION priv_testfunc6b(b int);
+DROP FUNCTION priv_testfunc7b(a int);
 DROP TABLE test5b;
 DROP TABLE test6b;
+DROP TABLE test6b2;
 DROP TABLE test9b;
 DROP TABLE test10b;
 DROP TYPE test7b;
@@ -1381,7 +1436,11 @@ DROP TYPE test8b;
 DROP CAST (priv_testdomain1 AS priv_testdomain3b);
 DROP FUNCTION castfunc(int) CASCADE;
 DROP DOMAIN priv_testdomain3b;
+DROP VIEW test16b;
 DROP TABLE test11b;
+DROP TABLE test17b;
+DROP TABLE test12;
+DROP TABLE test13;
 DROP TYPE priv_testtype1; -- ok
 DROP DOMAIN priv_testdomain1; -- ok
 -- truncate
@@ -2332,6 +2391,26 @@ SELECT makeaclitem('regress_priv_user1'::regrole, 'regress_priv_user2'::regrole,
 SELECT makeaclitem('regress_priv_user1'::regrole, 'regress_priv_user2'::regrole,
 	'SELECT, fake_privilege', FALSE);  -- error
 ERROR:  unrecognized privilege type: "fake_privilege"
+-- Test quoting and dequoting of user names in ACLs
+CREATE ROLE "regress_""quoted";
+SELECT makeaclitem('regress_"quoted'::regrole, 'regress_"quoted'::regrole,
+                   'SELECT', TRUE);
+               makeaclitem                
+------------------------------------------
+ "regress_""quoted"=r*/"regress_""quoted"
+(1 row)
+
+SELECT '"regress_""quoted"=r*/"regress_""quoted"'::aclitem;
+                 aclitem                  
+------------------------------------------
+ "regress_""quoted"=r*/"regress_""quoted"
+(1 row)
+
+SELECT '""=r*/""'::aclitem;  -- used to be misparsed as """"
+ERROR:  a name must follow the "/" sign
+LINE 1: SELECT '""=r*/""'::aclitem;
+               ^
+DROP ROLE "regress_""quoted";
 -- Test non-throwing aclitem I/O
 SELECT pg_input_is_valid('regress_priv_user1=r/regress_priv_user2', 'aclitem');
  pg_input_is_valid 
@@ -2798,6 +2877,11 @@ DROP USER regress_priv_user6;
 DROP USER regress_priv_user7;
 DROP USER regress_priv_user8; -- does not exist
 ERROR:  role "regress_priv_user8" does not exist
+-- leave some default ACLs for pg_upgrade's dump-restore test input.
+ALTER DEFAULT PRIVILEGES FOR ROLE pg_signal_backend
+	REVOKE USAGE ON TYPES FROM pg_signal_backend;
+ALTER DEFAULT PRIVILEGES FOR ROLE pg_read_all_settings
+	REVOKE USAGE ON TYPES FROM pg_read_all_settings;
 -- permissions with LOCK TABLE
 CREATE USER regress_locktable_user;
 CREATE TABLE lock_table (a int);

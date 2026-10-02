@@ -408,6 +408,16 @@ read_stream_begin_relation(int flags,
 	smgr = RelationGetSmgr(rel);
 
 	/*
+	 * Reject attempts to read non-local temporary relations; we would be
+	 * likely to get wrong data since we have no visibility into the owning
+	 * session's local buffers.
+	 */
+	if (rel && RELATION_IS_OTHER_TEMP(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary tables of other sessions")));
+
+	/*
 	 * NEON: We don't benefit from the OS readahead that callers with
 	 * READ_STREAM_SEQUENTIAL expect, so we disable that flag.
   	 */
@@ -468,7 +478,12 @@ read_stream_begin_relation(int flags,
 		LimitAdditionalLocalPins(&max_pinned_buffers);
 	else
 		LimitAdditionalPins(&max_pinned_buffers);
-	Assert(max_pinned_buffers > 0);
+
+	/*
+	 * The limit might be zero on a system configured with too few buffers for
+	 * the number of connections.  We need at least one to make progress.
+	 */
+	max_pinned_buffers = Max(1, max_pinned_buffers);
 
 	/*
 	 * We need one extra entry for buffers and per-buffer data, because users

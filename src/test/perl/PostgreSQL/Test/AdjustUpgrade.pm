@@ -157,6 +157,14 @@ sub adjust_database_contents
 				'drop function if exists public.putenv(text)',
 				'drop function if exists public.wait_pid(integer)');
 		}
+
+		# delete seg row that pre-14 was printed incorrectly but would now
+		# be printed correctly
+		if ($dbnames{contrib_regression_seg})
+		{
+			_add_st($result, 'contrib_regression_seg',
+				"delete from test_seg where s = '4.6 .. ~7.0'");
+		}
 	}
 
 	# user table OIDs are gone from release 12 on
@@ -511,6 +519,7 @@ my @_unused_view_qualifiers = (
 	{ obj => 'VIEW public.limit_thousand_v_2', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_3', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_4', qual => 'onek' },
+	{ obj => 'VIEW public.limit_thousand_v_5', qual => 'onek' },
 	# Since 14
 	{ obj => 'MATERIALIZED VIEW public.compressmv', qual => 'cmdata1' });
 

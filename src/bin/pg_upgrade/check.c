@@ -24,6 +24,7 @@ static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
 static void check_for_user_defined_postfix_ops(ClusterInfo *cluster);
 static void check_for_incompatible_polymorphics(ClusterInfo *cluster);
 static void check_for_tables_with_oids(ClusterInfo *cluster);
+static void check_for_not_null_inheritance(ClusterInfo *cluster);
 static void check_for_pg_role_prefix(ClusterInfo *cluster);
 static void check_for_new_tablespace_dir(void);
 static void check_for_user_defined_encoding_conversions(ClusterInfo *cluster);
@@ -478,7 +479,7 @@ check_for_data_types_usage(ClusterInfo *cluster, DataTypesUsageChecks *checks)
 				if (!results[checknum])
 				{
 					pg_log(PG_REPORT, "failed check: %s", _(cur_check->status));
-					appendPQExpBuffer(&report, "\n%s\n%s    %s\n",
+					appendPQExpBuffer(&report, "\n%s\n%s\n    %s\n",
 									  _(cur_check->report_text),
 									  _("A list of the problem columns is in the file:"),
 									  output_path);
@@ -647,6 +648,13 @@ check_and_dump_old_cluster(bool live_check)
 	 */
 	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1100)
 		check_for_tables_with_oids(&old_cluster);
+
+	/*
+	 * Pre-PG 18 allowed child tables to omit not-null constraints that their
+	 * parents columns have, but schema restore fails for them.  Verify there
+	 * are none.
+	 */
+	check_for_not_null_inheritance(&old_cluster);
 
 	/*
 	 * Pre-PG 10 allowed tables with 'unknown' type columns and non WAL logged
@@ -1576,6 +1584,85 @@ check_for_tables_with_oids(ClusterInfo *cluster)
 		check_ok();
 }
 
+/*
+ * check_for_not_null_inheritance()
+ *
+ * An attempt to create child tables lacking not-null constraints that are
+ * present in their parents errors out.  This can no longer occur since 18,
+ * but previously there were various ways for that to happen.  Check that
+ * the cluster to be upgraded doesn't have any of those problems.
+ */
+static void
+check_for_not_null_inheritance(ClusterInfo *cluster)
+{
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
+	int			ntup;
+
+	prep_status("Checking for not-null constraint inconsistencies");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "not_null_inconsistent_columns.txt");
+	for (int dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		bool		db_used = false;
+		int			i_nspname,
+					i_relname,
+					i_attname;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		res = executeQueryOrDie(conn,
+								"SELECT nspname, cc.relname, ac.attname "
+								"FROM pg_catalog.pg_inherits i, pg_catalog.pg_attribute ac, "
+								"     pg_catalog.pg_attribute ap, pg_catalog.pg_class cc, "
+								"     pg_catalog.pg_namespace nc "
+								"WHERE cc.oid = ac.attrelid AND i.inhrelid = ac.attrelid "
+								"      AND i.inhparent = ap.attrelid AND ac.attname = ap.attname "
+								"      AND cc.relnamespace = nc.oid "
+								"      AND ap.attnum > 0 and ap.attnotnull AND NOT ac.attnotnull");
+
+		ntup = PQntuples(res);
+		i_nspname = PQfnumber(res, "nspname");
+		i_relname = PQfnumber(res, "relname");
+		i_attname = PQfnumber(res, "attname");
+		for (int i = 0; i < ntup; i++)
+		{
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %m", output_path);
+			if (!db_used)
+			{
+				fprintf(script, "In database: %s\n", active_db->db_name);
+				db_used = true;
+			}
+
+			fprintf(script, "  %s.%s.%s\n",
+					PQgetvalue(res, i, i_nspname),
+					PQgetvalue(res, i, i_relname),
+					PQgetvalue(res, i, i_attname));
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (script)
+	{
+		fclose(script);
+		pg_log(PG_REPORT, "fatal");
+		pg_fatal("Your installation contains inconsistent NOT NULL constraints.\n"
+				 "If the parent column(s) are NOT NULL, then the child column must\n"
+				 "also be marked NOT NULL, or the upgrade will fail.\n"
+				 "You can fix this by running\n"
+				 "    ALTER TABLE tablename ALTER column SET NOT NULL;\n"
+				 "on each column listed in the file:\n"
+				 "    %s", output_path);
+	}
+	else
+		check_ok();
+}
 
 /*
  * check_for_pg_role_prefix()
@@ -1729,6 +1816,7 @@ check_new_cluster_logical_replication_slots(void)
 	int			nslots_on_old;
 	int			nslots_on_new;
 	int			max_replication_slots;
+	char	   *output_plugin_libraries;
 	char	   *wal_level;
 
 	/* Logical slots can be migrated since PG17. */
@@ -1762,10 +1850,10 @@ check_new_cluster_logical_replication_slots(void)
 	PQclear(res);
 
 	res = executeQueryOrDie(conn, "SELECT setting FROM pg_settings "
-							"WHERE name IN ('wal_level', 'max_replication_slots') "
+							"WHERE name IN ('wal_level', 'output_plugin_libraries', 'max_replication_slots') "
 							"ORDER BY name DESC;");
 
-	if (PQntuples(res) != 2)
+	if (PQntuples(res) != 3)
 		pg_fatal("could not determine parameter settings on new cluster");
 
 	wal_level = PQgetvalue(res, 0, 0);
@@ -1774,7 +1862,85 @@ check_new_cluster_logical_replication_slots(void)
 		pg_fatal("\"wal_level\" must be \"logical\" but is set to \"%s\"",
 				 wal_level);
 
-	max_replication_slots = atoi(PQgetvalue(res, 1, 0));
+	output_plugin_libraries = PQgetvalue(res, 1, 0);
+
+	/*
+	 * Make sure the output_plugin_libraries setting covers all plugins needed
+	 * by any migrated slots.
+	 */
+	if (nslots_on_old > 0)
+	{
+		char	   *guc_copy = pg_strdup(output_plugin_libraries);
+		char	  **allowed_plugins;
+		char		output_path[MAXPGPATH];
+		FILE	   *script = NULL;
+
+		if (!SplitGUCList(guc_copy, ',', &allowed_plugins))
+		{
+			/*
+			 * Should not happen. (Frontend and backend GUC_LIST_QUOTE parsing
+			 * have to remain compatible for pg_dump at minimum.)
+			 */
+			pg_fatal("could not parse \"output_plugin_libraries\" setting '%s'",
+					 output_plugin_libraries);
+		}
+
+		snprintf(output_path, sizeof(output_path), "%s/%s",
+				 log_opts.basedir,
+				 "disallowed_output_plugins.txt");
+
+		for (int dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+		{
+			LogicalSlotInfoArr *slot_arr = &old_cluster.dbarr.dbs[dbnum].slot_arr;
+
+			for (int slotnum = 0; slotnum < slot_arr->nslots; slotnum++)
+			{
+				LogicalSlotInfo *slot = &slot_arr->slots[slotnum];
+				bool		allowed = false;
+
+				/*
+				 * We expect the output_plugin_libraries length to be small in
+				 * practice; O(n*m) shouldn't be a problem here.
+				 */
+				for (char **p = allowed_plugins; *p; p++)
+				{
+					if (strcmp(slot->plugin, *p) == 0)
+					{
+						allowed = true;
+						break;
+					}
+				}
+
+				if (!allowed)
+				{
+					if (script == NULL &&
+						(script = fopen_priv(output_path, "w")) == NULL)
+						pg_fatal("could not open file \"%s\": %m", output_path);
+
+					fprintf(script, "The slot \"%s\" uses plugin \"%s\"\n",
+							slot->slotname, slot->plugin);
+				}
+			}
+		}
+
+		if (script)
+		{
+			fclose(script);
+
+			pg_log(PG_REPORT, "fatal");
+			pg_fatal("Your installation contains logical replication slots with plugins\n"
+					 "that are not allowed by the new cluster's output_plugin_libraries\n"
+					 "setting. You can add trusted plugins to output_plugin_libraries\n"
+					 "and/or remove affected slots, and then restart the upgrade.\n"
+					 "A list of the problematic slots is in the file:\n"
+					 "    %s", output_path);
+		}
+
+		pg_free(allowed_plugins);
+		pg_free(guc_copy);
+	}
+
+	max_replication_slots = atoi(PQgetvalue(res, 2, 0));
 
 	if (nslots_on_old > max_replication_slots)
 		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
@@ -1968,9 +2134,9 @@ check_old_cluster_subscription_state(void)
 		 * other states listed below are not supported:
 		 *
 		 * a) SUBREL_STATE_DATASYNC: A relation upgraded while in this state
-		 * would retain a replication slot, which could not be dropped by the
-		 * sync worker spawned after the upgrade because the subscription ID
-		 * used for the slot name won't match anymore.
+		 * would retain a replication slot and origin. The sync worker spawned
+		 * after the upgrade cannot be drop then because the subscription ID
+		 * used for the slot and origin name no longer matches.
 		 *
 		 * b) SUBREL_STATE_SYNCDONE: A relation upgraded while in this state
 		 * would retain the replication origin when there is a failure in

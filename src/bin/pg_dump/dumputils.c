@@ -19,6 +19,7 @@
 #include "dumputils.h"
 #include "fe_utils/string_utils.h"
 
+static const char restrict_chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 static bool parseAclItem(const char *item, const char *type,
 						 const char *name, const char *subname, int remoteVersion,
@@ -27,6 +28,43 @@ static bool parseAclItem(const char *item, const char *type,
 static char *dequoteAclUserName(PQExpBuffer output, char *input);
 static void AddAcl(PQExpBuffer aclbuf, const char *keyword,
 				   const char *subname);
+
+
+/*
+ * Sanitize a string to be included in an SQL comment or TOC listing, by
+ * replacing any newlines with spaces.  This ensures each logical output line
+ * is in fact one physical output line, to prevent corruption of the dump
+ * (which could, in the worst case, present an SQL injection vulnerability
+ * if someone were to incautiously load a dump containing objects with
+ * maliciously crafted names).
+ *
+ * The result is a freshly malloc'd string.  If the input string is NULL,
+ * return a malloc'ed empty string, unless want_hyphen, in which case return a
+ * malloc'ed hyphen.
+ *
+ * Note that we currently don't bother to quote names, meaning that the name
+ * fields aren't automatically parseable.  "pg_restore -L" doesn't care because
+ * it only examines the dumpId field, but someday we might want to try harder.
+ */
+char *
+sanitize_line(const char *str, bool want_hyphen)
+{
+	char	   *result;
+	char	   *s;
+
+	if (!str)
+		return pg_strdup(want_hyphen ? "-" : "");
+
+	result = pg_strdup(str);
+
+	for (s = result; *s != '\0'; s++)
+	{
+		if (*s == '\n' || *s == '\r')
+			*s = ' ';
+	}
+
+	return result;
+}
 
 
 /*
@@ -689,6 +727,7 @@ bool
 variable_is_guc_list_quote(const char *name)
 {
 	if (pg_strcasecmp(name, "local_preload_libraries") == 0 ||
+		pg_strcasecmp(name, "output_plugin_libraries") == 0 ||
 		pg_strcasecmp(name, "search_path") == 0 ||
 		pg_strcasecmp(name, "session_preload_libraries") == 0 ||
 		pg_strcasecmp(name, "shared_preload_libraries") == 0 ||
@@ -697,115 +736,6 @@ variable_is_guc_list_quote(const char *name)
 		return true;
 	else
 		return false;
-}
-
-/*
- * SplitGUCList --- parse a string containing identifiers or file names
- *
- * This is used to split the value of a GUC_LIST_QUOTE GUC variable, without
- * presuming whether the elements will be taken as identifiers or file names.
- * See comparable code in src/backend/utils/adt/varlena.c.
- *
- * Inputs:
- *	rawstring: the input string; must be overwritable!	On return, it's
- *			   been modified to contain the separated identifiers.
- *	separator: the separator punctuation expected between identifiers
- *			   (typically '.' or ',').  Whitespace may also appear around
- *			   identifiers.
- * Outputs:
- *	namelist: receives a malloc'd, null-terminated array of pointers to
- *			  identifiers within rawstring.  Caller should free this
- *			  even on error return.
- *
- * Returns true if okay, false if there is a syntax error in the string.
- */
-bool
-SplitGUCList(char *rawstring, char separator,
-			 char ***namelist)
-{
-	char	   *nextp = rawstring;
-	bool		done = false;
-	char	  **nextptr;
-
-	/*
-	 * Since we disallow empty identifiers, this is a conservative
-	 * overestimate of the number of pointers we could need.  Allow one for
-	 * list terminator.
-	 */
-	*namelist = nextptr = (char **)
-		pg_malloc((strlen(rawstring) / 2 + 2) * sizeof(char *));
-	*nextptr = NULL;
-
-	while (isspace((unsigned char) *nextp))
-		nextp++;				/* skip leading whitespace */
-
-	if (*nextp == '\0')
-		return true;			/* allow empty string */
-
-	/* At the top of the loop, we are at start of a new identifier. */
-	do
-	{
-		char	   *curname;
-		char	   *endp;
-
-		if (*nextp == '"')
-		{
-			/* Quoted name --- collapse quote-quote pairs */
-			curname = nextp + 1;
-			for (;;)
-			{
-				endp = strchr(nextp + 1, '"');
-				if (endp == NULL)
-					return false;	/* mismatched quotes */
-				if (endp[1] != '"')
-					break;		/* found end of quoted name */
-				/* Collapse adjacent quotes into one quote, and look again */
-				memmove(endp, endp + 1, strlen(endp));
-				nextp = endp;
-			}
-			/* endp now points at the terminating quote */
-			nextp = endp + 1;
-		}
-		else
-		{
-			/* Unquoted name --- extends to separator or whitespace */
-			curname = nextp;
-			while (*nextp && *nextp != separator &&
-				   !isspace((unsigned char) *nextp))
-				nextp++;
-			endp = nextp;
-			if (curname == nextp)
-				return false;	/* empty unquoted name not allowed */
-		}
-
-		while (isspace((unsigned char) *nextp))
-			nextp++;			/* skip trailing whitespace */
-
-		if (*nextp == separator)
-		{
-			nextp++;
-			while (isspace((unsigned char) *nextp))
-				nextp++;		/* skip leading whitespace for next */
-			/* we expect another name, so done remains false */
-		}
-		else if (*nextp == '\0')
-			done = true;
-		else
-			return false;		/* invalid syntax */
-
-		/* Now safe to overwrite separator with a null */
-		*endp = '\0';
-
-		/*
-		 * Finished isolating current name --- add it to output array
-		 */
-		*nextptr++ = curname;
-
-		/* Loop back if we didn't reach end of string */
-	} while (!done);
-
-	*nextptr = NULL;
-	return true;
 }
 
 /*
@@ -882,4 +812,41 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 	appendPQExpBufferStr(buf, ";\n");
 
 	pg_free(mine);
+}
+
+/*
+ * Generates a valid restrict key (i.e., an alphanumeric string) for use with
+ * psql's \restrict and \unrestrict meta-commands.  For safety, the value is
+ * chosen at random.
+ */
+char *
+generate_restrict_key(void)
+{
+	uint8		buf[64];
+	char	   *ret = palloc(sizeof(buf));
+
+	if (!pg_strong_random(buf, sizeof(buf)))
+		return NULL;
+
+	for (int i = 0; i < sizeof(buf) - 1; i++)
+	{
+		uint8		idx = buf[i] % strlen(restrict_chars);
+
+		ret[i] = restrict_chars[idx];
+	}
+	ret[sizeof(buf) - 1] = '\0';
+
+	return ret;
+}
+
+/*
+ * Checks that a given restrict key (intended for use with psql's \restrict and
+ * \unrestrict meta-commands) contains only alphanumeric characters.
+ */
+bool
+valid_restrict_key(const char *restrict_key)
+{
+	return restrict_key != NULL &&
+		restrict_key[0] != '\0' &&
+		strspn(restrict_key, restrict_chars) == strlen(restrict_key);
 }

@@ -64,6 +64,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -1348,9 +1349,10 @@ ExecDeletePrologue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 		if (context->estate->es_insert_pending_result_relations != NIL)
 			ExecPendingInserts(context->estate);
 
-		return ExecBRDeleteTriggers(context->estate, context->epqstate,
-									resultRelInfo, tupleid, oldtuple,
-									epqreturnslot, result, &context->tmfd);
+		return ExecBRDeleteTriggersNew(context->estate, context->epqstate,
+									   resultRelInfo, tupleid, oldtuple,
+									   epqreturnslot, result, &context->tmfd,
+									   context->mtstate->operation == CMD_MERGE);
 	}
 
 	return true;
@@ -1946,9 +1948,10 @@ ExecUpdatePrologue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 		if (context->estate->es_insert_pending_result_relations != NIL)
 			ExecPendingInserts(context->estate);
 
-		return ExecBRUpdateTriggers(context->estate, context->epqstate,
-									resultRelInfo, tupleid, oldtuple, slot,
-									result, &context->tmfd);
+		return ExecBRUpdateTriggersNew(context->estate, context->epqstate,
+									   resultRelInfo, tupleid, oldtuple, slot,
+									   result, &context->tmfd,
+									   context->mtstate->operation == CMD_MERGE);
 	}
 
 	return true;
@@ -2638,14 +2641,6 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 						 errmsg("could not serialize access due to concurrent update")));
 
 			/*
-			 * As long as we don't support an UPDATE of INSERT ON CONFLICT for
-			 * a partitioned table we shouldn't reach to a case where tuple to
-			 * be lock is moved to another partition due to concurrent update
-			 * of the partition key.
-			 */
-			Assert(!ItemPointerIndicatesMovedPartitions(&tmfd.ctid));
-
-			/*
 			 * Tell caller to try again from the very start.
 			 *
 			 * It does not make sense to use the usual EvalPlanQual() style
@@ -2662,7 +2657,6 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 						 errmsg("could not serialize access due to concurrent delete")));
 
 			/* see TM_Updated case */
-			Assert(!ItemPointerIndicatesMovedPartitions(&tmfd.ctid));
 			ExecClearTuple(existing);
 			return false;
 
@@ -3184,6 +3178,11 @@ lmerge_matched:
 							   *inputslot;
 					LockTupleMode lockmode;
 
+					if (IsolationUsesXactSnapshot())
+						ereport(ERROR,
+								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+								 errmsg("could not serialize access due to concurrent update")));
+
 					/*
 					 * The target tuple was concurrently updated by some other
 					 * transaction.  If we are currently processing a MATCHED
@@ -3223,7 +3222,7 @@ lmerge_matched:
 							 * the tuple moved, and setting our current
 							 * resultRelInfo to that.
 							 */
-							if (ItemPointerIndicatesMovedPartitions(&context->tmfd.ctid))
+							if (ItemPointerIndicatesMovedPartitions(tupleid))
 								ereport(ERROR,
 										(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 										 errmsg("tuple to be merged was already moved to another partition due to concurrent update")));
@@ -3271,12 +3270,13 @@ lmerge_matched:
 									if (ItemPointerIsValid(&lockedtid))
 										UnlockTuple(resultRelInfo->ri_RelationDesc, &lockedtid,
 													InplaceUpdateTupleLock);
-									LockTuple(resultRelInfo->ri_RelationDesc, &context->tmfd.ctid,
+									LockTuple(resultRelInfo->ri_RelationDesc, tupleid,
 											  InplaceUpdateTupleLock);
-									lockedtid = context->tmfd.ctid;
+									lockedtid = *tupleid;
 								}
+
 								if (!table_tuple_fetch_row_version(resultRelationDesc,
-																   &context->tmfd.ctid,
+																   tupleid,
 																   SnapshotAny,
 																   resultRelInfo->ri_oldTupleSlot))
 									elog(ERROR, "failed to fetch the target tuple");
@@ -3287,7 +3287,28 @@ lmerge_matched:
 
 								/* Switch lists, if necessary */
 								if (!*matched)
+								{
 									actionStates = mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE];
+
+									/*
+									 * If we have both NOT MATCHED BY SOURCE
+									 * and NOT MATCHED BY TARGET actions (a
+									 * full join between the source and target
+									 * relations), the single previously
+									 * matched tuple from the outer plan node
+									 * is treated as two not matched tuples,
+									 * in the same way as if they had not
+									 * matched to start with.  Therefore, we
+									 * must adjust the outer plan node's tuple
+									 * count, if we're instrumenting the
+									 * query, to get the correct "skipped" row
+									 * count --- see show_modifytable_info().
+									 */
+									if (outerPlanState(mtstate)->instrument &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET])
+										InstrUpdateTupleCount(outerPlanState(mtstate)->instrument, 1.0);
+								}
 							}
 
 							/*
@@ -3551,6 +3572,7 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 			switch (action->commandType)
 			{
 				case CMD_INSERT:
+					/* INSERT actions always use rootRelInfo */
 					ExecCheckPlanOutput(rootRelInfo->ri_RelationDesc,
 										action->targetList);
 
@@ -3590,9 +3612,23 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 					}
 					else
 					{
-						/* not partitioned? use the stock relation and slot */
-						tgtslot = resultRelInfo->ri_newTupleSlot;
-						tgtdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
+						/*
+						 * If the MERGE targets an inherited table, we insert
+						 * into the root table, so we must initialize its
+						 * "new" tuple slot, if not already done, and use its
+						 * relation descriptor for the projection.
+						 *
+						 * For non-inherited tables, rootRelInfo and
+						 * resultRelInfo are the same, and the "new" tuple
+						 * slot will already have been initialized.
+						 */
+						if (rootRelInfo->ri_newTupleSlot == NULL)
+							rootRelInfo->ri_newTupleSlot =
+								table_slot_create(rootRelInfo->ri_RelationDesc,
+												  &estate->es_tupleTable);
+
+						tgtslot = rootRelInfo->ri_newTupleSlot;
+						tgtdesc = RelationGetDescr(rootRelInfo->ri_RelationDesc);
 					}
 
 					action_state->mas_proj =
@@ -3623,6 +3659,113 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 					elog(ERROR, "unknown action in MERGE WHEN clause");
 					break;
 			}
+		}
+	}
+
+	/*
+	 * If the MERGE targets an inherited table, any INSERT actions will use
+	 * rootRelInfo, and rootRelInfo will not be in the resultRelInfo array.
+	 * Therefore we must initialize its WITH CHECK OPTION constraints and
+	 * RETURNING projection, as ExecInitModifyTable did for the resultRelInfo
+	 * entries.
+	 *
+	 * Note that the planner does not build a withCheckOptionList or
+	 * returningList for the root relation, but as in ExecInitPartitionInfo,
+	 * we can use the first resultRelInfo entry as a reference to calculate
+	 * the attno's for the root table.
+	 */
+	if (rootRelInfo != mtstate->resultRelInfo &&
+		rootRelInfo->ri_RelationDesc->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		(mtstate->mt_merge_subcommands & MERGE_INSERT) != 0)
+	{
+		Relation	rootRelation = rootRelInfo->ri_RelationDesc;
+		Relation	firstResultRel = mtstate->resultRelInfo[0].ri_RelationDesc;
+		int			firstVarno = mtstate->resultRelInfo[0].ri_RangeTableIndex;
+		AttrMap    *part_attmap = NULL;
+		bool		found_whole_row;
+
+		if (node->withCheckOptionLists != NIL)
+		{
+			List	   *wcoList;
+			List	   *wcoExprs = NIL;
+
+			/* There should be as many WCO lists as result rels */
+			Assert(list_length(node->withCheckOptionLists) ==
+				   list_length(node->resultRelations));
+
+			/*
+			 * Use the first WCO list as a reference. In the most common case,
+			 * this will be for the same relation as rootRelInfo, and so there
+			 * will be no need to adjust its attno's.
+			 */
+			wcoList = linitial(node->withCheckOptionLists);
+			if (rootRelation != firstResultRel)
+			{
+				/* Convert any Vars in it to contain the root's attno's */
+				part_attmap =
+					build_attrmap_by_name(RelationGetDescr(rootRelation),
+										  RelationGetDescr(firstResultRel),
+										  false);
+
+				wcoList = (List *)
+					map_variable_attnos((Node *) wcoList,
+										firstVarno, 0,
+										part_attmap,
+										RelationGetForm(rootRelation)->reltype,
+										&found_whole_row);
+			}
+
+			foreach(lc, wcoList)
+			{
+				WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
+				ExprState  *wcoExpr = ExecInitQual(castNode(List, wco->qual),
+												   &mtstate->ps);
+
+				wcoExprs = lappend(wcoExprs, wcoExpr);
+			}
+
+			rootRelInfo->ri_WithCheckOptions = wcoList;
+			rootRelInfo->ri_WithCheckOptionExprs = wcoExprs;
+		}
+
+		if (node->returningLists != NIL)
+		{
+			List	   *returningList;
+
+			/* There should be as many returning lists as result rels */
+			Assert(list_length(node->returningLists) ==
+				   list_length(node->resultRelations));
+
+			/*
+			 * Use the first returning list as a reference. In the most common
+			 * case, this will be for the same relation as rootRelInfo, and so
+			 * there will be no need to adjust its attno's.
+			 */
+			returningList = linitial(node->returningLists);
+			if (rootRelation != firstResultRel)
+			{
+				/* Convert any Vars in it to contain the root's attno's */
+				if (part_attmap == NULL)
+					part_attmap =
+						build_attrmap_by_name(RelationGetDescr(rootRelation),
+											  RelationGetDescr(firstResultRel),
+											  false);
+
+				returningList = (List *)
+					map_variable_attnos((Node *) returningList,
+										firstVarno, 0,
+										part_attmap,
+										RelationGetForm(rootRelation)->reltype,
+										&found_whole_row);
+			}
+			rootRelInfo->ri_returningList = returningList;
+
+			/* Initialize the RETURNING projection */
+			rootRelInfo->ri_projectReturning =
+				ExecBuildProjectionInfo(returningList, econtext,
+										mtstate->ps.ps_ResultTupleSlot,
+										&mtstate->ps,
+										RelationGetDescr(rootRelation));
 		}
 	}
 }
@@ -4029,8 +4172,12 @@ ExecModifyTable(PlanState *pstate)
 				relkind == RELKIND_MATVIEW ||
 				relkind == RELKIND_PARTITIONED_TABLE)
 			{
-				/* ri_RowIdAttNo refers to a ctid attribute */
-				Assert(AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo));
+				/*
+				 * ri_RowIdAttNo refers to a ctid attribute.  See the comment
+				 * in ExecInitModifyTable().
+				 */
+				Assert(AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo) ||
+					   relkind == RELKIND_PARTITIONED_TABLE);
 				datum = ExecGetJunkAttribute(slot,
 											 resultRelInfo->ri_RowIdAttNo,
 											 &isNull);
@@ -4406,7 +4553,8 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		/*
 		 * Verify result relation is a valid target for the current operation
 		 */
-		CheckValidResultRel(resultRelInfo, operation, mergeActions);
+		CheckValidResultRelNew(resultRelInfo, operation,
+							   node->onConflictAction, mergeActions);
 
 		resultRelInfo++;
 		i++;
@@ -4456,7 +4604,16 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 			{
 				resultRelInfo->ri_RowIdAttNo =
 					ExecFindJunkAttributeInTlist(subplan->targetlist, "ctid");
-				if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
+
+				/*
+				 * For heap relations, a ctid junk attribute must be present.
+				 * Partitioned tables should only appear here when all leaf
+				 * partitions were pruned, in which case no rows can be
+				 * produced and ctid is not needed.
+				 */
+				if (relkind == RELKIND_PARTITIONED_TABLE)
+					Assert(nrels == 1);
+				else if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
 					elog(ERROR, "could not find junk ctid column");
 			}
 			else if (relkind == RELKIND_FOREIGN_TABLE)

@@ -70,6 +70,14 @@ PostgreSQL documentation
    pg_upgrade supports upgrades from 9.2.X and later to the current
    major release of <productname>PostgreSQL</productname>, including snapshot and beta releases.
   </para>
+
+  <warning>
+   <para>
+    Upgrading a cluster causes the destination to execute arbitrary code of the
+    source superusers' choice.  Ensure that the source superusers are trusted
+    before upgrading.
+   </para>
+  </warning>
  </refsect1>
 
  <refsect1>
@@ -439,8 +447,10 @@ make prefix=/usr/local/pgsql.new install
      </listitem>
      <listitem>
       <para>
-       The output plugins referenced by the slots on the old cluster must be
-       installed in the new PostgreSQL executable directory.
+       The output plugins referenced by the slots in the old cluster must be
+       installed in the new PostgreSQL executable directory. They must also be
+       included in the new cluster's <xref linkend="guc-output-plugin-libraries"/>;
+       see that parameter's documentation for safety information.
       </para>
      </listitem>
      <listitem>
