@@ -692,9 +692,12 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 	if (ISARRKEY(newval))
 	{
 		char	   *cache = (char *) fcinfo->flinfo->fn_extra;
-		TRGM	   *cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
+		TRGM	   *cachedVal = NULL;
 		Size		newvalsize = VARSIZE(newval);
 		BITVECP		sign;
+
+		if (cache != NULL)
+			cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
 
 		/*
 		 * Cache the sign data across multiple calls with the same newval.
@@ -890,7 +893,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			else
 				size_alpha = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_l) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -903,7 +906,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			else
 				size_beta = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_r) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else

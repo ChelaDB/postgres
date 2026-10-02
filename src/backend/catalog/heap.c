@@ -550,9 +550,13 @@ CheckAttributeNamesTypes(TupleDesc tupdesc, char relkind,
 	 */
 	for (i = 0; i < natts; i++)
 	{
-		CheckAttributeType(NameStr(TupleDescAttr(tupdesc, i)->attname),
-						   TupleDescAttr(tupdesc, i)->atttypid,
-						   TupleDescAttr(tupdesc, i)->attcollation,
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+		CheckAttributeType(NameStr(attr->attname),
+						   attr->atttypid,
+						   attr->attcollation,
 						   NIL, /* assume we're creating a new rowtype */
 						   flags);
 	}
@@ -686,6 +690,16 @@ CheckAttributeType(const char *attname,
 		 */
 		CheckAttributeType(attname, get_range_subtype(atttypid),
 						   get_range_collation(atttypid),
+						   containing_rowtypes,
+						   flags);
+	}
+	else if (att_typtype == TYPTYPE_MULTIRANGE)
+	{
+		/*
+		 * If it's a multirange, recurse to check its plain range type.
+		 */
+		CheckAttributeType(attname, get_multirange_range(atttypid),
+						   InvalidOid,	/* range types are not collatable */
 						   containing_rowtypes,
 						   flags);
 	}
@@ -871,6 +885,9 @@ AddNewAttributeTuples(Oid new_rel_oid,
 	/* add dependencies on their datatypes and collations */
 	for (int i = 0; i < natts; i++)
 	{
+		if (tupdesc->attrs[i].attisdropped)
+			continue;
+
 		/* Add dependency info */
 		ObjectAddressSubSet(myself, RelationRelationId, new_rel_oid, i + 1);
 		ObjectAddressSet(referenced, TypeRelationId,
@@ -2277,6 +2294,9 @@ SetAttrMissing(Oid relid, char *attname, char *value)
  * for this is that the missing value must never be updated after it is set,
  * which can only be when a column is added to the table. Otherwise we would
  * in effect be changing existing tuples.
+ *
+ * NB: Caller is responsible for ensuring the user has USAGE on all types expr
+ * depends on.
  */
 Oid
 StoreAttrDefault(Relation rel, AttrNumber attnum,
@@ -2469,6 +2489,9 @@ StoreAttrDefault(Relation rel, AttrNumber attnum,
  * in the pg_class entry for the relation.
  *
  * The OID of the new constraint is returned.
+ *
+ * NB: Caller is responsible for ensuring the user has USAGE on all types expr
+ * depends on.
  */
 static Oid
 StoreRelCheck(Relation rel, const char *ccname, Node *expr,
@@ -2727,6 +2750,13 @@ AddRelationNewConstraints(Relation rel,
 			 castNode(Const, expr)->constisnull))
 			continue;
 
+		/*
+		 * The below call to StoreAttrDefault() adds the dependencies on
+		 * types.  We are responsible for checking USAGE.
+		 */
+		if (!is_internal)
+			CheckUsageOnTypesInSingleRelExpr(expr, RelationGetRelid(rel), GetUserId());
+
 		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal,
 								  false);
 
@@ -2767,6 +2797,14 @@ AddRelationNewConstraints(Relation rel,
 			 */
 			expr = cookConstraint(pstate, cdef->raw_expr,
 								  RelationGetRelationName(rel));
+
+			/*
+			 * The below call to StoreRelCheck() calls CreateConstraintEntry(),
+			 * which adds the dependencies on types.  We are responsible for
+			 * checking USAGE.
+			 */
+			if (!is_internal)
+				CheckUsageOnTypesInSingleRelExpr(expr, RelationGetRelid(rel), GetUserId());
 		}
 		else
 		{
@@ -3811,12 +3849,16 @@ StorePartitionKey(Relation rel,
 	 * columns, i.e. they become internally dependent on the whole table.
 	 */
 	if (partexprs)
+	{
+		CheckUsageOnTypesInSingleRelExpr((Node *) partexprs, RelationGetRelid(rel),
+										 GetUserId());
 		recordDependencyOnSingleRelExpr(&myself,
 										(Node *) partexprs,
 										RelationGetRelid(rel),
 										DEPENDENCY_NORMAL,
 										DEPENDENCY_INTERNAL,
 										true /* reverse the self-deps */ );
+	}
 
 	/*
 	 * We must invalidate the relcache so that the next
