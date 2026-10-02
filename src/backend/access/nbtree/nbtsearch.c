@@ -2812,7 +2812,8 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 		if (IsolationIsSerializable())
 		{
 			PredicateLockRelation(rel, scan->xs_snapshot);
-			buf = _bt_get_endpoint(rel, 0, ScanDirectionIsBackward(dir));
+			buf = _bt_get_endpoint(rel, 0, ScanDirectionIsBackward(dir),
+								   &parent);
 		}
 
 		if (!BufferIsValid(buf))
