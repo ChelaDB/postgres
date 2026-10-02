@@ -1579,6 +1579,16 @@ FinishWalRecovery(void)
 	StandbyMode = false;
 
 	/*
+	 * We cannot start generating new WAL if we don't have a valid prev-LSN
+	 * to use for the first new WAL record. (Shouldn't happen.)
+	 */
+	if (NeonRecoveryRequested &&!neonWriteOk)
+		ereport(ERROR,
+				(errmsg("cannot start in read-write mode from this base backup")));
+
+	// FIXME: should we unlink neon.signal?
+
+	/*
 	 * Determine where to start writing WAL next.
 	 *
 	 * Re-fetch the last valid or last applied record, so we can identify the
@@ -1640,34 +1650,36 @@ FinishWalRecovery(void)
 		}
 	}
 
+	elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(endOfLog));
+
 	/*
 	 * Copy the last partial block to the caller, for initializing the WAL
 	 * buffer for appending new WAL.
 	 */
-	/*
-	 * When starting from a neon base backup, we don't have WAL. Initialize
-	 * the WAL page where we will start writing new records from scratch,
-	 * instead.
-	 */
-	if (NeonRecoveryRequested)
+	if (endOfLog % XLOG_BLCKSZ != 0)
 	{
-		if (!neonWriteOk)
+		char	   *page;
+		int			len;
+		XLogRecPtr	pageBeginPtr;
+
+		pageBeginPtr = endOfLog - (endOfLog % XLOG_BLCKSZ);
+
+		/* Copy the valid part of the last block */
+		len = endOfLog % XLOG_BLCKSZ;
+		page = palloc(len);
+
+		/*
+		 * With neon, it's possible that we start without having read any WAL
+		 * whatsoever. In that case, initialize the WAL page where we will
+		 * start writing new records from scratch, instead.
+		 */
+		if (NeonRecoveryRequested && endOfLog == RedoStartLSN)
 		{
-			/*
-			 * We cannot start generating new WAL if we don't have a valid prev-LSN
-			 * to use for the first new WAL record. (Shouldn't happen.)
-			 */
-			ereport(ERROR,
-					(errmsg("cannot start in read-write mode from this base backup")));
-		}
-		else
-		{
-			int			offs = endOfLog % XLOG_BLCKSZ;
-			XLogRecPtr	pageBeginPtr = endOfLog - offs;
 			bool		isLongHeader = (pageBeginPtr % wal_segment_size) == 0;
 			int			lastPageSize = isLongHeader ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
-			char	   *page = palloc0(offs);
 			XLogPageHeader xlogPageHdr = (XLogPageHeader) page;
+
+			Assert(len >= lastPageSize);
 
 			xlogPageHdr->xlp_pageaddr = pageBeginPtr;
 			xlogPageHdr->xlp_magic = XLOG_PAGE_MAGIC;
@@ -1678,7 +1690,7 @@ FinishWalRecovery(void)
 			 * page header there is a record ending where actual data will
 			 * start.
 			 */
-			xlogPageHdr->xlp_rem_len = offs - lastPageSize;
+			xlogPageHdr->xlp_rem_len = len - lastPageSize;
 			if (xlogPageHdr->xlp_rem_len > 0)
 				xlogPageHdr->xlp_info |= XLP_FIRST_IS_CONTRECORD;
 			readOff = XLogSegmentOffset(pageBeginPtr, wal_segment_size);
@@ -1693,26 +1705,13 @@ FinishWalRecovery(void)
 
 				xlogPageHdr->xlp_info |= XLP_LONG_HEADER;
 			}
-			result->lastPageBeginPtr = pageBeginPtr;
-			result->lastPage = page;
-			elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(xlogreader->EndRecPtr));
-
-			// FIXME: should we unlink neon.signal?
 		}
-	}
-	else if (endOfLog % XLOG_BLCKSZ != 0)
-	{
-		char	   *page;
-		int			len;
-		XLogRecPtr	pageBeginPtr;
+		else
+		{
+			Assert(readOff == XLogSegmentOffset(pageBeginPtr, wal_segment_size));
 
-		pageBeginPtr = endOfLog - (endOfLog % XLOG_BLCKSZ);
-		Assert(readOff == XLogSegmentOffset(pageBeginPtr, wal_segment_size));
-
-		/* Copy the valid part of the last block */
-		len = endOfLog % XLOG_BLCKSZ;
-		page = palloc(len);
-		memcpy(page, xlogreader->readBuf, len);
+			memcpy(page, xlogreader->readBuf, len);
+		}
 
 		result->lastPageBeginPtr = pageBeginPtr;
 		result->lastPage = page;
@@ -1810,7 +1809,22 @@ PerformWalRecovery(void)
 	 * checkpoint record itself, if it's a shutdown checkpoint).
 	 */
 	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	if (RedoStartLSN < CheckPointLoc)
+	if (NeonRecoveryRequested)
+	{
+		/*
+		 * In Neon recovery mode, we can start from any record, not only at a
+		 * checkpoint. The Neon signal file includes an explicit "PREV LSN"
+		 * field, which is the LSN of the previous record, before the point at
+		 * which we start up. Initialize lastReplayedRecPtr from that, as if
+		 * we had just replayed that record.
+		 */
+		Assert(xlogreader->ReadRecPtr == InvalidXLogRecPtr);
+		Assert(xlogreader->EndRecPtr == RedoStartLSN);
+		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
+		XLogRecoveryCtl->lastReplayedReadRecPtr = neonLastRec;
+		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
+	}
+	else if (RedoStartLSN < CheckPointLoc)
 	{
 		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
 		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
