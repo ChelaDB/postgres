@@ -8017,6 +8017,16 @@ StartupXLOG(void)
 	StandbyMode = false;
 
 	/*
+	 * We cannot start generating new WAL if we don't have a valid prev-LSN
+	 * to use for the first new WAL record. (Shouldn't happen.)
+	 */
+	if (NeonRecoveryRequested &&!neonWriteOk)
+		ereport(ERROR,
+				(errmsg("cannot start in read-write mode from this base backup")));
+
+	// FIXME: should we unlink neon.signal?
+
+	/*
 	 * Determine where to start writing WAL next.
 	 *
 	 * When recovery ended in an incomplete record, write a WAL record about
@@ -8024,44 +8034,43 @@ StartupXLOG(void)
 	 * valid or last applied record, so we can identify the exact endpoint of
 	 * what we consider the valid portion of WAL.
 	 *
-	 * When starting from a neon base backup, we don't have WAL. Initialize
-	 * the WAL page where we will start writing new records from scratch,
-	 * instead.
+	 * With neon, it's possible that we start without having read any WAL
+	 * whatsoever. In that case, initialize the WAL page where we will
+	 * start writing new records from scratch, instead.
 	 */
-	if (NeonRecoveryRequested)
+	if (NeonRecoveryRequested && EndRecPtr == RedoStartLSN)
 	{
-		if (!neonWriteOk)
+		XLogRecPtr	endOfLog = EndRecPtr;
+		char	   *page;
+		int			len;
+		XLogRecPtr	pageBeginPtr;
+
+		pageBeginPtr = endOfLog - (endOfLog % XLOG_BLCKSZ);
+
+		len = endOfLog % XLOG_BLCKSZ;
+		page = xlogreader->readBuf;
+
+		if (len > 0)
 		{
-			/*
-			 * We cannot start generating new WAL if we don't have a valid prev-LSN
-			 * to use for the first new WAL record. (Shouldn't happen.)
-			 */
-			ereport(ERROR,
-					(errmsg("cannot start in read-write mode from this base backup")));
-		}
-		else
-		{
-			int			offs = EndRecPtr % XLOG_BLCKSZ;
-			XLogRecPtr	lastPage = EndRecPtr - offs;
-			bool		isLongHeader = (lastPage % wal_segment_size) == 0;
+			bool		isLongHeader = (pageBeginPtr % wal_segment_size) == 0;
 			int			lastPageSize = isLongHeader ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
-			int			idx = XLogRecPtrToBufIdx(lastPage);
-			char	   *page = XLogCtl->pages + idx * XLOG_BLCKSZ;
 			XLogPageHeader xlogPageHdr = (XLogPageHeader) page;
 
-			xlogPageHdr->xlp_pageaddr = lastPage;
+			Assert(len >= lastPageSize);
+
+			xlogPageHdr->xlp_pageaddr = pageBeginPtr;
 			xlogPageHdr->xlp_magic = XLOG_PAGE_MAGIC;
-			xlogPageHdr->xlp_tli = ThisTimeLineID;
+			xlogPageHdr->xlp_tli = recoveryTargetTLI;
 			xlogPageHdr->xlp_info = 0;
 			/*
 			 * If we start writing with offset from page beginning, pretend in
 			 * page header there is a record ending where actual data will
 			 * start.
 			 */
-			xlogPageHdr->xlp_rem_len = offs - lastPageSize;
+			xlogPageHdr->xlp_rem_len = len - lastPageSize;
 			if (xlogPageHdr->xlp_rem_len > 0)
 				xlogPageHdr->xlp_info |= XLP_FIRST_IS_CONTRECORD;
-			readOff = XLogSegmentOffset(lastPage, wal_segment_size);
+			readOff = XLogSegmentOffset(pageBeginPtr, wal_segment_size);
 
 			if (isLongHeader)
 			{
@@ -8073,10 +8082,10 @@ StartupXLOG(void)
 
 				xlogPageHdr->xlp_info |= XLP_LONG_HEADER;
 			}
-
-			elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(EndRecPtr));
-
-			// FIXME: should we unlink neon.signal?
+		}
+		else
+		{
+			Assert(readOff == XLogSegmentOffset(pageBeginPtr, wal_segment_size));
 		}
 	}
 	else
@@ -8096,6 +8105,8 @@ StartupXLOG(void)
 	 * timeline.
 	 */
 	EndOfLogTLI = xlogreader->seg.ws_tli;
+
+	elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(EndOfLog));
 
 	/*
 	 * Complain if we did not roll forward far enough to render the backup
@@ -8163,7 +8174,7 @@ StartupXLOG(void)
 	 * In a normal crash recovery, we can just extend the timeline we were in.
 	 */
 	PrevTimeLineID = ThisTimeLineID;
-	if (ArchiveRecoveryRequested)
+	if (ArchiveRecoveryRequested && !NeonRecoveryRequested)
 	{
 		char		reason[200];
 		char		recoveryPath[MAXPGPATH];
@@ -8288,8 +8299,7 @@ StartupXLOG(void)
 		/* Copy the valid part of the last block, and zero the rest */
 		page = &XLogCtl->pages[firstIdx * XLOG_BLCKSZ];
 		len = EndOfLog % XLOG_BLCKSZ;
-		if (!NeonRecoveryRequested)
-			memcpy(page, xlogreader->readBuf, len);
+		memcpy(page, xlogreader->readBuf, len);
 		memset(page + len, 0, XLOG_BLCKSZ - len);
 
 		XLogCtl->xlblocks[firstIdx] = pageBeginPtr + XLOG_BLCKSZ;
