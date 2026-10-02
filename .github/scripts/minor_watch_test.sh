@@ -28,6 +28,7 @@ if [[ "$1" == "api" ]]; then
         exit 1
     fi
 elif [[ "$1 $2" == "issue list" ]]; then
+    printf '%s\n' "$args" >>"$FIX/list_args"
     cat "$FIX/issues"
 else
     printf '%s\n' "$args" >>"$FIX/writes"
@@ -102,6 +103,8 @@ ok_if "17.5 vs 17.11: body lists 17.6 through 17.11" \
 ok_if "17.5 vs 17.11: the list starts at 17.6 and has no beta/rc tags" \
     bash -c "grep -q 'Missing minors: 17\\.6,' \"\$1\" && ! grep -Eq 'BETA|RC' \"\$1\"" _ "$FIX/writes"
 ok_if "the security label is created before the issue" first_write_is_label
+# The duplicate check must see closed issues too, so `issue list` needs --state all.
+ok_if "issue list is called with --state all" grep -q -- '--state all' "$FIX/list_args"
 
 # 2. Equal versions: nothing.
 setup
@@ -164,6 +167,14 @@ PATH="$tmp/bin:$PATH" FROZEN_FILE="$tmp/FROZEN" "$script" >"$tmp/out" 2>"$tmp/er
 rc=$?
 ok_if "empty tag listing: exits non-zero" test "$rc" -ne 0
 ok_if "empty tag listing: no writes" test ! -s "$FIX/writes"
+
+# 9. An issue list as long as the --limit may be truncated: fail loudly.
+setup
+seq 1 1000 | sed 's/^/Unrelated issue /' >"$FIX/issues"
+PATH="$tmp/bin:$PATH" FROZEN_FILE="$tmp/FROZEN" "$script" >"$tmp/out" 2>"$tmp/err"
+rc=$?
+ok_if "issue list at the limit: exits non-zero" test "$rc" -ne 0
+ok_if "issue list at the limit: no writes" test ! -s "$FIX/writes"
 
 if ((failures > 0)); then
     echo "$failures failure(s)"

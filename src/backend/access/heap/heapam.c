@@ -281,10 +281,13 @@ AssertHasSnapshotForToast(Relation rel)
  * update, the old heap block is the record's last block reference), so an
  * extra VM block reference would make it clear the wrong VM bits and store
  * the heap record a second time against the VM page.  Neither problem the
- * upstream fix addresses applies here: there are no local incremental
- * backups, and a VM page is WAL-logged as a full image whenever it is
- * evicted (see neon_wallog_page).  We keep upstream's VM locking, which
- * is harmless.  The redo routines below still accept a registered VM block,
+ * upstream fix addresses applies here: there is no local relation storage
+ * (pages are materialized by the pageserver, which applies the VM clears
+ * from the record flags, so no VM page can be torn locally), and we do not
+ * support incremental backups based on WAL summaries.  (A VM page also gets
+ * a full-page image when evicted from a primary's buffer cache, see
+ * neon_wallog_page, but that is not what we rely on.)  We keep upstream's
+ * VM locking, which is harmless.  The redo routines below still accept a registered VM block,
  * as upstream's do, and otherwise use the old fallback path.
  */
 

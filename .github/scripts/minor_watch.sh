@@ -56,7 +56,16 @@ ensure_label() {
 
 main() {
     local existing major have n tags newest missing list title body
-    existing="$(gh issue list -R "$repo" --state all --limit 1000 --json title --jq '.[].title')"
+    # `gh issue list` does not paginate past --limit and truncates silently, so
+    # a result that fills the limit is an error: raise the limit (or paginate)
+    # before this repo gets that many issues.
+    local limit=1000 count
+    existing="$(gh issue list -R "$repo" --state all --limit "$limit" --json title --jq '.[].title')"
+    count="$(grep -c '' <<<"$existing" || true)"
+    if ((count >= limit)); then
+        echo "minor_watch: ${count} issues listed (limit ${limit}); the list may be truncated, raise the limit" >&2
+        exit 1
+    fi
     local label_ready=0
 
     for major in $majors; do
