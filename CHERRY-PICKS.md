@@ -2,7 +2,7 @@
 
 This file decides, for each major, which of Neon's own Postgres commits we carry on our `REL_1x_STABLE_cheladb` branches. Neon's `REL_1x_STABLE_neon` branches kept moving after the commits our fork pins, while Neon's public `neon` repository (and with it `pgxn/neon`) effectively stopped at those pins. Many of the later Postgres commits only make sense with a newer, unpublished neon extension. We take the self-contained fixes and leave the rest.
 
-Triage date: 2026-10-01. Extension checked against: `ChelaDB/neon` at `fa504217c61bbcaf5c512d75830564541f917f8f` (its `vendor/revisions.json` pins exactly the commits below, and its `pgxn/neon` last changed on 2025-07-30).
+Triage date: 2026-10-01. Extension checked against: `chelabase/neon` at `fa504217c61bbcaf5c512d75830564541f917f8f` (its `vendor/revisions.json` pins exactly the commits below, and its `pgxn/neon` last changed on 2025-07-30).
 
 | Major | Pin (our branch head) | Pin minor | Target minor | Neon branch head at triage |
 |---|---|---|---|---|
@@ -15,7 +15,7 @@ Triage date: 2026-10-01. Extension checked against: `ChelaDB/neon` at `fa504217c
 
 1. Candidates: `git log --no-merges <pin>..upstream-neon/REL_<x>_STABLE_neon ^REL_<x>_<target>`. Upstream commits that Neon brought in through its minor merges are reachable from the target tag, so they drop out here; our own minor merges (plan Tasks 6 and 7) bring them.
 2. Upstream equivalents that Neon cherry-picked separately (different sha): `git cherry postgres/REL_<x>_STABLE upstream-neon/REL_<x>_STABLE_neon`, plus matching author, date and subject against the target tag. These are `skip-upstream`, with the first upstream minor that contains them.
-3. Every remaining commit was read (`git show --stat`, then the diff), and each hook, GUC, lock and symbol it touches was grepped in `git grep <sym> fa504217 -- pgxn/neon` in `ChelaDB/neon`.
+3. Every remaining commit was read (`git show --stat`, then the diff), and each hook, GUC, lock and symbol it touches was grepped in `git grep <sym> fa504217 -- pgxn/neon` in `chelabase/neon`.
 4. Every pick was test-applied in a scratch worktree: our branch head, `git merge REL_<x>_<target>` (the merge conflicts are in files no pick touches; they were resolved as "ours" for the test only), then `git cherry-pick -x` of the picks in the order below. The objects the picks touch were then compiled (`configure`, `make generated-headers`, then the touched `.o` files).
 
 ## Classes
