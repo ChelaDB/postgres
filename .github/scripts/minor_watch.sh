@@ -9,7 +9,7 @@
 # title exists, open or closed.
 #
 # Environment:
-#   GITHUB_REPOSITORY  this repo (default ChelaDB/postgres); GH_TOKEN for gh
+#   GITHUB_REPOSITORY  this repo (default chelabase/postgres); GH_TOKEN for gh
 #   UPSTREAM           repo holding the release tags (default postgres/postgres)
 #   MAJORS             majors to watch (default "14 15 16 17")
 #   FROZEN_FILE        majors to skip, one per line, `#` comments and blank
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo="${GITHUB_REPOSITORY:-ChelaDB/postgres}"
+repo="${GITHUB_REPOSITORY:-chelabase/postgres}"
 upstream="${UPSTREAM:-postgres/postgres}"
 majors="${MAJORS:-14 15 16 17}"
 frozen_file="${FROZEN_FILE:-$here/../../FROZEN}"
