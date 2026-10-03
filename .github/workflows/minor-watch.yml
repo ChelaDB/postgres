@@ -2,9 +2,9 @@ name: minor-watch
 
 # Daily check for new PostgreSQL minor releases (see .github/scripts/minor_watch.sh).
 # Opens "Merge PostgreSQL <major>.<n>" (label security) for each major in 14-17
-# that is not listed in FROZEN and whose REL_<major>_STABLE_cheladb is behind
+# that is not listed in FROZEN and whose REL_<major>_STABLE_chelabase is behind
 # the newest REL_<major>_<n> tag on postgres/postgres. Scheduled workflows run
-# from the default branch only (REL_17_STABLE_cheladb).
+# from the default branch only (REL_17_STABLE_chelabase).
 
 on:
   schedule:

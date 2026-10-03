@@ -2,7 +2,7 @@
 # Watches postgres/postgres for new minor releases (minor-watch.yml, daily).
 #
 # For each major in 14-17 that is not listed in FROZEN, compares the version in
-# configure.ac's AC_INIT on REL_<major>_STABLE_cheladb with the newest
+# configure.ac's AC_INIT on REL_<major>_STABLE_chelabase with the newest
 # REL_<major>_<n> tag on postgres/postgres (beta and rc tags are ignored). When
 # the tag is newer it opens the issue "Merge PostgreSQL <major>.<n>" (label
 # `security`), listing every missing minor, unless an issue with that exact
@@ -32,7 +32,7 @@ is_frozen() {
 fork_minor() {
     local major="$1" line
     line="$(gh api -H 'Accept: application/vnd.github.raw' \
-        "repos/${repo}/contents/configure.ac?ref=REL_${major}_STABLE_cheladb" | grep -m1 '^AC_INIT')"
+        "repos/${repo}/contents/configure.ac?ref=REL_${major}_STABLE_chelabase" | grep -m1 '^AC_INIT')"
     if [[ "$line" =~ \[${major}\.([0-9]+)\] ]]; then
         echo "${BASH_REMATCH[1]}"
     else
@@ -95,7 +95,7 @@ main() {
         fi
         list=""
         for n in "${missing[@]}"; do list+="${list:+, }${major}.${n}"; done
-        body="REL_${major}_STABLE_cheladb is at ${major}.${have}; postgres/postgres has released ${major}.${newest}. Missing minors: ${list}. Merge the upstream tags REL_${major}_$((have + 1)) through REL_${major}_${newest} into REL_${major}_STABLE_cheladb, in order. Release notes: https://www.postgresql.org/docs/release/${major}.${newest}/"
+        body="REL_${major}_STABLE_chelabase is at ${major}.${have}; postgres/postgres has released ${major}.${newest}. Missing minors: ${list}. Merge the upstream tags REL_${major}_$((have + 1)) through REL_${major}_${newest} into REL_${major}_STABLE_chelabase, in order. Release notes: https://www.postgresql.org/docs/release/${major}.${newest}/"
         if [[ "$dry_run" == "1" ]]; then
             echo "DRY RUN: would open \"$title\" (label security): $body"
             continue
