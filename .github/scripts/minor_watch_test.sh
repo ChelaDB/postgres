@@ -21,7 +21,7 @@ if [[ "$1" == "api" ]]; then
     if [[ "$args" =~ matching-refs/tags/REL_([0-9]+)_ ]]; then
         [[ -e "$FIX/tags_fail" ]] && exit 1
         cat "$FIX/tags_${BASH_REMATCH[1]}"
-    elif [[ "$args" =~ contents/configure.ac\?ref=REL_([0-9]+)_STABLE_cheladb ]]; then
+    elif [[ "$args" =~ contents/configure.ac\?ref=REL_([0-9]+)_STABLE_chelabase ]]; then
         cat "$FIX/ac_${BASH_REMATCH[1]}"
     else
         echo "stub gh: unexpected api call: $args" >&2

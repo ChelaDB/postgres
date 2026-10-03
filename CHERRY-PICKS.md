@@ -1,6 +1,6 @@
 # Cherry-picks from Neon's Postgres branches
 
-This file decides, for each major, which of Neon's own Postgres commits we carry on our `REL_1x_STABLE_cheladb` branches. Neon's `REL_1x_STABLE_neon` branches kept moving after the commits our fork pins, while Neon's public `neon` repository (and with it `pgxn/neon`) effectively stopped at those pins. Many of the later Postgres commits only make sense with a newer, unpublished neon extension. We take the self-contained fixes and leave the rest.
+This file decides, for each major, which of Neon's own Postgres commits we carry on our `REL_1x_STABLE_chelabase` branches. Neon's `REL_1x_STABLE_neon` branches kept moving after the commits our fork pins, while Neon's public `neon` repository (and with it `pgxn/neon`) effectively stopped at those pins. Many of the later Postgres commits only make sense with a newer, unpublished neon extension. We take the self-contained fixes and leave the rest.
 
 Triage date: 2026-10-01. Extension checked against: `chelabase/neon` at `fa504217c61bbcaf5c512d75830564541f917f8f` (its `vendor/revisions.json` pins exactly the commits below, and its `pgxn/neon` last changed on 2025-07-30).
 
